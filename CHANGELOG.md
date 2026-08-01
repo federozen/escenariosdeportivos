@@ -1,3 +1,14 @@
+## 3.5.2
+
+- Transformó el Chat libre en una experiencia **guiada + libre**.
+- Incorporó selector de equipo y segundo equipo para comparaciones.
+- Agregó categorías visibles para playoffs, copas, descenso, fecha, rendimiento, redacción, tablas y control de datos.
+- Sumó buscador de funciones por palabra y botones que envían la consulta automáticamente.
+- Añadió un índice completo de opciones sin eliminar el campo de escritura libre.
+- Amplió la detección de consultas como «¿en qué zona está…?».
+- Añadió pruebas de regresión específicas del descubrimiento de funciones del chat.
+- Total de la entrega: 31 tests automatizados aprobados.
+
 ## 3.5
 
 - Integró el impacto en copas y descenso dentro de **Mesa de redacción → Previa de la fecha**.
@@ -98,3 +109,8 @@
 - Panel de clasificados, eliminados y equipos en carrera.
 - Las mismas herramientas también se abren desde el Panel por equipo.
 - Diecisiete tests automatizados aprobados.
+
+## 3.5.1
+- Restaurados los accesos principales visibles desde el comienzo.
+- Agregados botones directos para las seis herramientas de Escenarios, incluida Distribución.
+- Añadida prueba automática de regresión de navegación.

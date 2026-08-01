@@ -1,4 +1,4 @@
-# Calculadora del Fútbol Argentino · LPF 2026 · versión 3.5
+# Calculadora del Fútbol Argentino · LPF 2026 · versión 3.5.2
 
 Aplicación editorial en Python y Streamlit para analizar playoffs por zonas, Tabla Anual, Libertadores, Sudamericana, descenso, promedios y escenarios de una fecha.
 
@@ -7,6 +7,26 @@ La versión 3 prioriza tres objetivos:
 1. **Base coherente:** Zonas, Tabla Anual, promedios, fixture y resultados se reconcilian antes de habilitar una cuenta.
 2. **Explicación honesta:** distingue hechos exactos, garantías matemáticas, cotas conservadoras y estimaciones.
 3. **Uso guiado:** ya no es necesario recordar preguntas del chat; el Explorador permite elegir equipo, objetivo y tarea.
+
+## Mejora 3.5.2
+
+- El **Chat libre** pasó a funcionar también como **Chat guiado**.
+- Nuevo explorador con selector de equipo, rival para comparar y categorías temáticas.
+- Buscador de funciones por palabra: playoffs, Libertadores, Sudamericana, descenso, promedios, previa, distribución y otras.
+- Cada opción se ejecuta con un botón y envía automáticamente la consulta al chat.
+- Se agregó un índice completo de capacidades y se mantiene el campo de texto para preguntas propias y seguimientos.
+- Se incorporaron pruebas de regresión para conservar el catálogo, el buscador y la entrada libre.
+
+Ver `ACTUALIZACION_3_5_2.md` para el detalle.
+
+## Corrección 3.5.1
+
+- Restaurados como botones visibles los seis espacios principales.
+- Accesos directos desde el comienzo a todas las herramientas de Escenarios, incluida **Distribución**.
+- Las herramientas de Escenarios ya no quedan ocultas dentro de pestañas: se eligen desde un selector visible.
+- Se mantienen sin cambios las narrativas de la fecha, Copas y Descenso de la versión 3.5.
+
+Ver `ACTUALIZACION_3_5_1.md` para el detalle.
 
 ## Novedades 3.5
 
@@ -59,7 +79,7 @@ streamlit run calculadora_futbol_argentino.py
 - **Escenarios:** herramientas adaptadas de la calculadora del Mundial: gana/empata/pierde, qué pasa si, puesto puntual, mejor/peor caso, distribución y clasificados/eliminados.
 - **Mesa de redacción:** informes de previa y post fecha listos para trabajar.
 - **Visualizaciones:** vistas por equipo, zona, próxima fecha, otra cancha y Radar final.
-- **Chat libre:** consultas abiertas y seguimientos contextuales.
+- **Chat guiado + libre:** catálogo por categorías, buscador, botones por equipo y consultas abiertas para seguimientos contextuales.
 - **Datos y auditoría:** semáforo de calidad, inconsistencias, partidos inferidos y respaldo.
 
 ## Flujo recomendado

@@ -5508,10 +5508,216 @@ AYUDA_LIGA = """Esto es una **liga** (muchas fechas): trabajo **por puntos**. Co
 Si cargaste por **tabla + fechas**, con eso me alcanza para todas estas cuentas (no necesito los resultados).
 Configurá las zonas con nombre en «🎨 Zonas con nombre» del panel."""
 
-BIENVENIDA = ("👋 Este es el **Chat libre**. No hace falta memorizar comandos: arriba tenés el "
-              "**Panel por equipo**, que reúne las consultas habituales por equipo y objetivo. "
-              "Acá podés hacer seguimientos como *«¿y si empata?»*, *«sumá los postergados»* o "
-              "*«explicame por qué»*. Debajo también aparecen accesos rápidos.")
+BIENVENIDA = ("👋 Este es el **Chat guiado + libre**. Arriba tenés un explorador con todas las "
+              "consultas ordenadas por tema: elegí equipo, categoría y tocá una opción. También podés "
+              "buscar una función por palabra. El campo libre queda para preguntas propias y seguimientos "
+              "como *«¿y si empata?»*, *«sumá los postergados»* o *«explicame por qué»*.")
+
+
+def _chat_catalog(E, team, other):
+    """Catálogo visible del chat. Cada opción termina en una consulta soportada por el router."""
+    team = team or ((E.get("equipos") or ["River Plate"])[0])
+    other = other or team
+    if E.get("modo") == "lpf2026":
+        return {
+            "⭐ Más usadas": [
+                ("Previa del equipo", "Partido, rango de puestos e impacto en playoffs, copas o descenso.", f"Previa de {team}"),
+                ("Qué necesita", "Piso, techo, cruces directos y caminos para alcanzar el objetivo.", f"¿Qué necesita {team} para los playoffs?"),
+                ("Qué le conviene", "Resultados de otras canchas que mejoran su escenario.", f"¿Qué le conviene a {team} para los playoffs?"),
+                ("Tabla de las zonas", "Posiciones actuales y línea del top 8.", "Tabla de las dos zonas"),
+                ("Libertadores", "Panorama general de los cupos por la Tabla Anual.", "¿Cómo está la clasificación a la Libertadores?"),
+                ("Sudamericana", "Panorama general de los cupos por la Tabla Anual.", "¿Cómo está la clasificación a la Sudamericana?"),
+                ("Descenso", "Impacto combinado de la anual y los promedios.", "¿Cómo está el descenso?"),
+                ("Previa de la fecha", "Pantallazo partido por partido de la próxima jornada.", "Previa de la fecha"),
+            ],
+            "🏆 Playoffs": [
+                ("Qué necesita para entrar", "Cuenta exacta para terminar entre los ocho.", f"¿Qué necesita {team} para los playoffs?"),
+                ("Chances de playoffs", "Probabilidad estimada de entrar al top 8.", f"Chances de {team} para los playoffs"),
+                ("Depende de sí mismo", "Distingue garantía propia de resultados ajenos.", f"¿{team} depende de sí mismo para los playoffs?"),
+                ("Qué resultados le sirven", "La otra cancha y los cruces que más lo favorecen.", f"¿Qué le conviene a {team} para los playoffs?"),
+                ("Cómo puede terminar la fecha", "Mejor y peor posición posible en la próxima ventana.", f"¿Cómo puede terminar la fecha {team}?"),
+                ("Árbol gana/empata/pierde", "Cómo cambian sus chances según su próximo resultado.", f"Árbol de {team}"),
+                ("Cruces de octavos", "Llaves si el torneo terminara hoy.", "Cruces de octavos"),
+                ("Proyección de puntos", "Puntaje final si cada equipo mantiene su ritmo.", "Proyección de puntos"),
+                ("Puntos máximos", "Techo matemático de los equipos de cada zona.", "Puntos máximos"),
+                ("Relato de la zona", "Texto breve y publicable sobre la pelea por el top 8.", f"Relato de la zona de {team}"),
+            ],
+            "🌎 Copas": [
+                ("Panorama de Libertadores", "Clasificados actuales, corte y cupos que pueden liberarse.", "¿Cómo está la clasificación a la Libertadores?"),
+                ("Panorama de Sudamericana", "Clasificados actuales y distancia al corte.", "¿Cómo está la clasificación a la Sudamericana?"),
+                ("Tabla Anual", "Acumulada del año que reparte copas y define un descenso.", "Tabla Anual"),
+                ("Llega a Libertadores", "Caminos y puntaje que necesita el equipo.", f"¿{team} llega a la Libertadores?"),
+                ("Llega a Sudamericana", "Caminos y puntaje que necesita el equipo.", f"¿{team} llega a la Sudamericana?"),
+                ("Chances de Libertadores", "Probabilidad estimada sobre la anual sin campeones.", f"Chances de {team} para la Libertadores"),
+                ("Chances de Sudamericana", "Probabilidad estimada sobre la anual sin campeones.", f"Chances de {team} para la Sudamericana"),
+                ("Qué le conviene para Libertadores", "Resultados ajenos que mejoran su acceso a la copa.", f"¿Qué le conviene a {team} para la Libertadores?"),
+                ("Qué le conviene para Sudamericana", "Resultados ajenos que mejoran su acceso a la copa.", f"¿Qué le conviene a {team} para la Sudamericana?"),
+                ("Panorama completo de copas", "Libertadores y Sudamericana en una misma respuesta.", "Copas 2027"),
+            ],
+            "📉 Descenso": [
+                ("Panorama del descenso", "Quién baja hoy por anual y quién por promedio.", "¿Cómo está el descenso?"),
+                ("Tabla de promedios", "Coeficientes, piso y techo de cada equipo.", "Promedios"),
+                ("Situación del equipo", "Riesgo por las dos vías y qué necesita para salvarse.", f"¿Qué necesita {team} para no descender?"),
+                ("Chances de descenso", "Probabilidad estimada para equipos de la zona baja.", f"Chances de {team} para el descenso"),
+                ("Qué le conviene para salvarse", "Resultados ajenos que lo alejan de la zona roja.", f"¿Qué le conviene a {team} para salvarse?"),
+                ("Promedio del equipo", "Coeficiente actual y efecto de sumar 0, 1 o 3 puntos.", f"Promedio de {team}"),
+                ("Relato del descenso", "Texto breve sobre la pelea de abajo.", "Relato del descenso"),
+                ("Tabla Anual", "La otra vía del descenso, además de los promedios.", "Tabla Anual"),
+            ],
+            "📅 Fecha y escenarios": [
+                ("Previa de toda la fecha", "Resumen de todos los partidos y lo que está en juego.", "Previa de la fecha"),
+                ("Previa de un equipo", "Su partido y el rango de posiciones posible.", f"Previa de {team}"),
+                ("Qué se juega cada equipo", "Una frase editorial por participante.", "Qué se juega cada equipo"),
+                ("Partido bisagra", "Encuentro que puede mover más la clasificación.", f"Partido bisagra de {team}"),
+                ("Árbol del próximo partido", "Gana, empata o pierde y cómo cambia el escenario.", f"Árbol de {team}"),
+                ("Distribución de la zona", "Probabilidad estimada de terminar en cada franja de la tabla.", f"Distribución de puestos de {team}"),
+                ("Estado de la fecha", "Qué ya está cargado, qué se jugó y qué falta.", "Estado de la fecha"),
+                ("Si terminara hoy", "Foto actual de posiciones y clasificaciones.", "Si terminara hoy"),
+                ("Partidos que le quedan", "Fixture restante y dificultad del camino.", f"¿Contra quién juega {team}?"),
+            ],
+            "🔎 Equipo y rendimiento": [
+                ("Ficha completa", "Puesto, puntos, DG, ritmo y rivales pendientes.", f"Ficha de {team}"),
+                ("Forma reciente", "Últimos cinco partidos y puntos obtenidos.", f"Forma de {team}"),
+                ("Racha", "Secuencia actual de triunfos, empates o derrotas.", f"Racha de {team}"),
+                ("Local y visitante", "Rendimiento separado por condición.", f"De local y de visitante {team}"),
+                ("Calendario restante", "Dificultad del fixture que le queda.", f"Calendario de {team}"),
+                ("Comparar equipos", "Cara a cara por puntos, techo y objetivo.", f"Comparar {team} y {other}"),
+                ("Cómo viene", "Termómetro general de sus chances.", f"¿Cómo viene {team}?"),
+                ("Distribución de puestos", "Probabilidad estimada de terminar en cada zona.", f"Distribución de puestos de {team}"),
+                ("Explicar la última respuesta", "Desarma la cuenta anterior paso a paso.", "¿Por qué?"),
+            ],
+            "🗞️ Para redactar": [
+                ("Relato de la zona", "Panorama breve con posiciones, puntos y diferencia de gol.", f"Relato de la zona de {team}"),
+                ("Previa general de la fecha", "Pantallazo editorial de todos los partidos.", "Previa de la fecha"),
+                ("Qué se juega cada equipo", "Un renglón utilizable como copete o placa.", "Qué se juega cada equipo"),
+                ("Relato de Libertadores", "Texto publicable sobre la clasificación a la copa.", "Relato de la Libertadores"),
+                ("Relato de Sudamericana", "Texto publicable sobre la clasificación a la copa.", "Relato de la Sudamericana"),
+                ("Relato del descenso", "Texto publicable sobre anual y promedios.", "Relato del descenso"),
+                ("Relato de su zona", "Resumen periodístico de la pelea en la zona donde juega.", f"Contame el escenario de {team}"),
+            ],
+            "📊 Tablas y visuales": [
+                ("Tabla de las zonas", "Vista completa con la línea del top 8.", "Tabla de las dos zonas"),
+                ("Tabla Anual", "Acumulada para copas y descenso.", "Tabla Anual"),
+                ("Promedios", "Coeficientes con piso y techo.", "Promedios"),
+                ("Proyección", "Puntos finales al ritmo actual.", "Proyección"),
+                ("Máximos", "Puntaje máximo alcanzable por cada equipo.", "Máximos"),
+                ("Distribución", "Chances por puesto o zona del equipo elegido.", f"Barras de {team}"),
+                ("Chances por zonas", "Distribución probabilística de clasificación en ambas zonas.", "Mapa de posiciones"),
+                ("Comparación", "Cuadro cara a cara entre dos equipos.", f"Comparar {team} y {other}"),
+            ],
+            "🧾 Datos y ayuda": [
+                ("Estado de la fecha", "Partidos cargados, pendientes y en curso.", "Estado de la fecha"),
+                ("Verificar actualización", "Controla si las tablas quedaron viejas.", "¿Está actualizado?"),
+                ("Buscar un equipo", "Ubica automáticamente su zona.", f"¿En qué zona está {team}?"),
+                ("Ver todos los grupos", "Lista grupos y equipos cargados.", "¿Qué grupos hay?"),
+                ("Guía completa", "Muestra la ayuda extensa con todos los comandos.", "Ayuda"),
+            ],
+        }
+
+    return {
+        "⭐ Más usadas": [
+            ("Qué necesita", "Resultados que lo clasifican o acercan al objetivo.", f"¿Qué necesita {team}?"),
+            ("Qué le conviene", "Resultados propios y ajenos más favorables.", f"¿Qué le conviene a {team}?"),
+            ("Tabla", "Posiciones actuales del grupo o liga.", "Tabla"),
+            ("Panorama", "Resumen general de la competencia.", "Panorama"),
+            ("Probabilidades", "Distribución estimada de clasificación o puestos.", "Probabilidades"),
+            ("Relato", "Texto periodístico listo para usar.", f"Contame el escenario de {team}"),
+        ],
+        "🎯 Escenarios": [
+            ("Qué necesita", "Cuenta por resultados o puntos.", f"¿Qué necesita {team}?"),
+            ("Qué le conviene", "Mejor combinación propia y ajena.", f"¿Qué le conviene a {team}?"),
+            ("Puesto exacto", "Qué resultados lo dejan en una posición concreta.", f"{team} puede salir 1º"),
+            ("Número mágico", "Puntos que aseguran el objetivo.", f"Número mágico de {team}"),
+            ("Si terminara hoy", "Clasificados y orden actual.", "Si terminara hoy"),
+            ("Simulador", "Fija resultados y recalcula la tabla.", "Simulador: qué pasa si"),
+        ],
+        "📊 Análisis y visuales": [
+            ("Comparar", "Cara a cara entre dos equipos.", f"Comparar {team} y {other}"),
+            ("Mapa", "Mapa de calor de puestos posibles.", "Mapa del grupo"),
+            ("Distribución", "Barras de posiciones posibles.", f"Barras de {team}"),
+            ("Partido bisagra", "Encuentro que más define.", "Partido bisagra"),
+            ("Proyección", "Puntaje final al ritmo actual.", "Proyección"),
+            ("Máximos", "Techos matemáticos.", "Máximos"),
+        ],
+        "🗞️ Para redactar": [
+            ("Relato del grupo", "Panorama listo para publicar.", "Relato del grupo"),
+            ("Escenario de un equipo", "Texto centrado en un participante.", f"Contame el escenario de {team}"),
+            ("Previa de la fecha", "Qué define cada partido pendiente.", "Previa de la fecha"),
+            ("Qué se juega cada uno", "Una frase por equipo.", "Qué se juega cada equipo"),
+        ],
+        "🧾 Ayuda": [
+            ("Guía completa", "Lista extensa de capacidades y ejemplos.", "Ayuda"),
+            ("Explicar la cuenta", "Desarma la última respuesta.", "¿Por qué?"),
+            ("Buscar grupo", "Ubica un equipo en el torneo cargado.", f"¿En qué grupo está {team}?"),
+            ("Listar grupos", "Muestra todos los grupos disponibles.", "¿Qué grupos hay?"),
+        ],
+    }
+
+
+def _render_chat_explorer(E):
+    """Selector y buscador de capacidades. Devuelve la consulta elegida o None."""
+    equipos_chat = list(dict.fromkeys(E.get("equipos") or []))
+    if not equipos_chat:
+        equipos_chat = ["River Plate"]
+    default_team = "River Plate" if "River Plate" in equipos_chat else equipos_chat[0]
+    if st.session_state.get("ultimo_equipo") in equipos_chat:
+        default_team = st.session_state["ultimo_equipo"]
+    default_idx = equipos_chat.index(default_team)
+    if "chat_guide_team" in st.session_state and st.session_state.get("chat_guide_team") not in equipos_chat:
+        st.session_state["chat_guide_team"] = default_team
+
+    st.markdown("#### 🧭 Encontrá una opción del chat")
+    st.caption("No hace falta recordar frases: elegí un equipo y un tema, o buscá una función. Al tocar un botón, la consulta se envía al chat.")
+    c_team, c_other, c_search = st.columns([1.05, 1.05, 1.4])
+    team = c_team.selectbox("Equipo principal", equipos_chat, index=default_idx, key="chat_guide_team")
+    otros = [e for e in equipos_chat if e != team] or [team]
+    if "chat_guide_other" in st.session_state and st.session_state.get("chat_guide_other") not in otros:
+        st.session_state["chat_guide_other"] = otros[0]
+    other = c_other.selectbox("Comparar con", otros, key="chat_guide_other")
+    search = c_search.text_input(
+        "Buscar una función",
+        placeholder="Ej.: Libertadores, previa, promedios, distribución…",
+        key="chat_guide_search",
+    ).strip()
+
+    catalog = _chat_catalog(E, team, other)
+    categories = list(catalog)
+    if "chat_guide_category" in st.session_state and st.session_state.get("chat_guide_category") not in categories:
+        st.session_state["chat_guide_category"] = categories[0]
+    category = st.selectbox("Tema", categories, key="chat_guide_category")
+
+    if search:
+        needle = _zlow(search)
+        visible = []
+        for cat, options in catalog.items():
+            for label, desc, prompt in options:
+                if needle in _zlow(" ".join((cat, label, desc, prompt))):
+                    visible.append((cat, label, desc, prompt))
+        st.caption(f"Resultados para **{search}**: {len(visible)} opción{'es' if len(visible) != 1 else ''}.")
+    else:
+        visible = [(category, *option) for option in catalog[category]]
+
+    clicked = None
+    if not visible:
+        st.info("No encontré esa función. Probá otra palabra o tocá **Guía completa** en el índice.")
+    else:
+        for start in range(0, len(visible), 3):
+            row = visible[start:start + 3]
+            cols = st.columns(3)
+            for offset, (cat, label, desc, prompt) in enumerate(row):
+                col = cols[offset]
+                key_base = f"chat_catalog_{categories.index(cat)}_{catalog[cat].index((label, desc, prompt))}"
+                if col.button(label, use_container_width=True, help=prompt, key=key_base):
+                    clicked = prompt
+                col.caption(desc)
+
+    with st.expander("📚 Índice completo de opciones"):
+        st.caption("Este índice reúne todas las consultas disponibles en el chat. Cambiá el tema de arriba para convertirlas en botones.")
+        for cat, options in catalog.items():
+            st.markdown(f"**{cat}**")
+            st.markdown("\n".join(f"- **{label}:** {desc}" for label, desc, _ in options))
+
+    return clicked
 
 
 # ─── EJECUTOR DETERMINÍSTICO (las cuentas las hace el motor, nunca el LLM) ─────────
@@ -7164,7 +7370,7 @@ def _parse_kw(q):
     if _posq and has("puede salir", "puede ser", "puede terminar", "puede quedar", "sale ", "termina", "terminar", "queda ", "salir") and not has("necesita", "conviene"):
         return {"intent": "puesto", "equipo": team, "n": _posq}
     # navegación de grupos
-    if has("en que grupo", "en cual grupo", "donde juega", "donde esta", "de que grupo", "grupo de", "que grupo es"):
+    if has("en que grupo", "en cual grupo", "en que zona", "en cual zona", "donde juega", "donde esta", "de que grupo", "de que zona", "grupo de", "zona de", "que grupo es", "que zona es"):
         return {"intent": "buscar_equipo", "equipo": q}
     if has("que grupos", "cuales grupos", "lista de grupos", "todos los grupos", "ver grupos") or qn.strip() == "grupos":
         return {"intent": "listar_grupos"}
@@ -8203,16 +8409,25 @@ def render_scenarios_workspace(E, default_team=None, embedded=False):
     base = Z[lab]
     annual = lpf_anual_base(Z, E.get("apertura") or {})
     previous = st.session_state.get("PROMEDIOS") or {}
-    tabs = st.tabs([
+    scenario_labels = [
         "Gana / empata / pierde",
         "Qué pasa si…",
         "Puntaje y puesto",
         "Mejor y peor caso",
         "Distribución",
         "Clasificados y eliminados",
-    ])
+    ]
+    if st.session_state.get("scenario_tool_nav") not in scenario_labels:
+        st.session_state["scenario_tool_nav"] = scenario_labels[0]
+    scenario_tool = st.radio(
+        "Herramienta de escenarios",
+        scenario_labels,
+        horizontal=True,
+        key="scenario_tool_nav",
+        help="Todas las herramientas vuelven a quedar visibles y accesibles desde el inicio.",
+    )
 
-    with tabs[0]:
+    if scenario_tool == "Gana / empata / pierde":
         scope_label = st.radio(
             "Alcance",
             ["Fecha oficial", "Sólo postergados", "Fecha + postergados"],
@@ -8228,7 +8443,7 @@ def render_scenarios_workspace(E, default_team=None, embedded=False):
             st.dataframe(frame, use_container_width=True, hide_index=True)
         st.caption("Esta vista recupera la lógica central del Mundial: separar claramente qué ocurre si el equipo gana, empata o pierde.")
 
-    with tabs[1]:
+    if scenario_tool == "Qué pasa si…":
         scope_label = st.radio(
             "Ventana a simular",
             ["Fecha oficial", "Sólo postergados", "Fecha + postergados"],
@@ -8273,7 +8488,7 @@ def render_scenarios_workspace(E, default_team=None, embedded=False):
             else:
                 st.info("Elegí uno o más resultados. El resto de los partidos quedará abierto y el motor calculará el rango posible.")
 
-    with tabs[2]:
+    if scenario_tool == "Puntaje y puesto":
         full_games = [match for match in pending if match[0] in base or match[1] in base]
         _render_point_ladder(team, base, rest, full_games, 8, f"{team} · escalera de clasificación")
         st.divider()
@@ -8300,7 +8515,7 @@ def render_scenarios_workspace(E, default_team=None, embedded=False):
             else:
                 st.warning(f"No existe un puntaje alcanzable que permita a {team} terminar {int(target_rank)}º.")
 
-    with tabs[3]:
+    if scenario_tool == "Mejor y peor caso":
         scope_label = st.radio(
             "Ventana",
             ["Fecha oficial", "Fecha + postergados"],
@@ -8330,7 +8545,7 @@ def render_scenarios_workspace(E, default_team=None, embedded=False):
                     st.dataframe(_scenario_outcomes_frame(worst.get("outcomes")), use_container_width=True, hide_index=True)
                 st.caption("Son combinaciones concretas que prueban los extremos del rango. No son necesariamente las únicas.")
 
-    with tabs[4]:
+    if scenario_tool == "Distribución":
         n = st.select_slider("Cantidad de simulaciones", options=[2000, 5000, 10000, 20000], value=5000,
                              key=f"scenario_distribution_n_{team}")
         if st.button("Calcular distribución estimada de posiciones", use_container_width=True,
@@ -8343,7 +8558,7 @@ def render_scenarios_workspace(E, default_team=None, embedded=False):
             st.dataframe(frame, use_container_width=True, hide_index=True)
             st.caption("ESTIMACIÓN: usa el modelo de fuerza y localía de la aplicación. No reemplaza los rangos exactos por puntos.")
 
-    with tabs[5]:
+    if scenario_tool == "Clasificados y eliminados":
         table = liga_tabla_df(base)
         rows = []
         for _, row in table.iterrows():
@@ -8642,13 +8857,56 @@ with st.sidebar:
         st.rerun()
 
 
-_workspace = st.radio(
-    "Espacio de trabajo",
-    ["🧭 Panel por equipo", "🎯 Escenarios", "🗞️ Mesa de redacción", "📊 Visualizaciones", "💬 Chat libre", "🧪 Datos y auditoría"],
-    horizontal=True,
-    label_visibility="collapsed",
-    help="El Panel por equipo reúne las consultas habituales. Escenarios expone las herramientas adaptadas del Mundial; la Mesa produce informes; Visualizaciones explora gráficos; el Chat queda para consultas libres; Auditoría controla la base.",
-)
+_WORKSPACES = [
+    "🧭 Panel por equipo",
+    "🎯 Escenarios",
+    "🗞️ Mesa de redacción",
+    "📊 Visualizaciones",
+    "💬 Chat libre",
+    "🧪 Datos y auditoría",
+]
+if st.session_state.get("workspace_nav") not in _WORKSPACES:
+    st.session_state["workspace_nav"] = _WORKSPACES[0]
+
+
+def _go_to_workspace(workspace, scenario_tool=None):
+    st.session_state["workspace_nav"] = workspace
+    if scenario_tool is not None:
+        st.session_state["scenario_tool_nav"] = scenario_tool
+
+
+st.markdown("### Accesos principales")
+_main_cols = st.columns(len(_WORKSPACES))
+for _col, _label in zip(_main_cols, _WORKSPACES):
+    _col.button(
+        _label,
+        use_container_width=True,
+        type="primary" if st.session_state["workspace_nav"] == _label else "secondary",
+        key=f"workspace_button_{_label}",
+        on_click=_go_to_workspace,
+        args=(_label,),
+    )
+
+_SCENARIO_SHORTCUTS = [
+    ("Gana / empata / pierde", "Gana / empata / pierde"),
+    ("Qué pasa si…", "Qué pasa si…"),
+    ("Puntaje y puesto", "Puntaje y puesto"),
+    ("Mejor y peor caso", "Mejor y peor caso"),
+    ("Distribución", "Distribución"),
+    ("Clasificados / eliminados", "Clasificados y eliminados"),
+]
+st.caption("Herramientas rápidas de Escenarios")
+_scenario_cols = st.columns(len(_SCENARIO_SHORTCUTS))
+for _col, (_button_label, _tool_label) in zip(_scenario_cols, _SCENARIO_SHORTCUTS):
+    _col.button(
+        _button_label,
+        use_container_width=True,
+        key=f"scenario_shortcut_{_tool_label}",
+        on_click=_go_to_workspace,
+        args=("🎯 Escenarios", _tool_label),
+    )
+
+_workspace = st.session_state["workspace_nav"]
 if _workspace == "🧭 Panel por equipo":
     render_guided_workspace(st.session_state.ESTADO)
     st.stop()
@@ -8668,7 +8926,7 @@ if _workspace == "🧪 Datos y auditoría":
 
 # ─── CHAT ────────────────────────────────────────────────────────────────────────
 modo = "🤖 con Claude" if (st.session_state.LLM_ON and str(st.session_state.LLM_KEY).strip()) else "🔤 por palabras clave"
-st.subheader(f"💬 Chat libre · {modo}")
+st.subheader(f"💬 Chat guiado + libre · {modo}")
 
 _gs_tot = _tour_grupos()
 if len(_gs_tot) > 1:
@@ -8678,6 +8936,9 @@ if len(_gs_tot) > 1:
 
 if "chat" not in st.session_state:
     st.session_state.chat = [{"role": "assistant", "blocks": [("md", BIENVENIDA)]}]
+
+catalog_click = _render_chat_explorer(E)
+st.divider()
 
 for _mi, msg in enumerate(st.session_state.chat):
     with st.chat_message(msg["role"], avatar="⚽" if msg["role"] == "assistant" else None):
@@ -8698,27 +8959,8 @@ if esc is not None and pendientes:
         else:
             st.caption("Elegí al menos un resultado para ver el efecto.")
 
-st.caption("Sugerencias rápidas:")
-if E.get("modo") == "lpf2026":
-    _e0 = "River Plate" if "River Plate" in equipos else (equipos[0] if equipos else "River")
-    sug1 = [f"Previa de {_e0}", f"¿Qué necesita {_e0} para los playoffs?", "¿Cómo está la clasificación a la Libertadores?", "¿Cómo está la clasificación a la Sudamericana?"]
-    sug2 = ["¿Cómo está el descenso?", f"¿Cómo viene la zona de {_e0}?", f"¿Qué le conviene a {_e0}?", f"Ficha de {_e0}"]
-    sug3 = ["Tabla de las dos zonas", "Copas 2027", "Escenarios", "Ayuda"]
-elif E.get("modo") == "liga_tabla" or esc is None:
-    _e0 = equipos[0] if equipos else "River"
-    sug1 = ["Tabla", f"¿Qué necesita {_e0}?", "Proyección", "Promedios"]
-    sug2 = [f"Ficha de {_e0}", "Calendario", "Chances por zona", "Ayuda"]
-else:
-    sug1 = [f"¿Cómo viene {equipos[0]}?", f"¿Qué necesita {equipos[0]}?", "¿De quién depende?", "Si terminara hoy"]
-    sug2 = [f"Contame el escenario de {equipos[0]}", "Qué se juega cada equipo", "Partido bisagra", "Ayuda"]
-clic = None
-for fila in ((sug1, sug2, sug3) if E.get("modo") == "lpf2026" else (sug1, sug2)):
-    for c, s in zip(st.columns(len(fila)), fila):
-        if c.button(s, use_container_width=True, key=f"sug_{s}"):
-            clic = s
-
-prompt = st.chat_input("Preguntá: «¿qué necesita River para los playoffs?», «¿cómo está el descenso?», «copas 2027»…")
-consulta = prompt or clic
+prompt = st.chat_input("Escribí una pregunta propia o elegí una opción en el explorador de arriba…")
+consulta = prompt or catalog_click
 if consulta:
     st.session_state.chat.append({"role": "user", "blocks": [("md", consulta)]})
     try:
