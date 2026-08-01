@@ -112,3 +112,23 @@ El optimizador exacto se usa editorialmente en la definición. Para horizontes g
 - seis a cuatro: Radar y escalera exacta;
 - tres a dos: escenarios reducidos;
 - una: árbol exhaustivo, sujeto a los desempates disponibles.
+
+## Capa de narrativas de competencia (v3.3)
+
+`lpf_competition_narratives.py` contiene renderizadores puros de Markdown para:
+
+- zonas;
+- Libertadores;
+- Sudamericana;
+- descenso.
+
+No usa Streamlit ni consulta fuentes externas. Recibe datos ya validados y evita que el Chat, la Mesa y Visualizaciones redacten versiones distintas de la misma situación.
+
+La información cambiante de Copa Argentina se guarda en el estado LPF con:
+
+- `copa_arg_vivos`;
+- `copa_arg_updated`;
+- `copa_arg_source`;
+- `copa_arg_reemplazo`.
+
+ESPN es un proveedor de cotejo. El usuario conserva la posibilidad de carga manual y la aplicación no reemplaza la foto vigente si la respuesta externa es incompleta.

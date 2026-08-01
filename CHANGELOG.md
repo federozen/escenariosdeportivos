@@ -1,3 +1,13 @@
+## 3.3
+
+- Mejoró la narrativa de Zona A y Zona B con PJ, DG, GF, igualdad del corte, distancias y tabla breve.
+- Agregó relatos generales de Libertadores, Sudamericana y descenso.
+- Incorporó explicación dinámica de cupos que se corren por campeones futuros.
+- Sumó seguimiento de equipos vivos en Copa Argentina con lista manual, foto de octavos y cotejo ESPN.
+- Sumó el reemplazo reglamentario de ARGENTINA 3 dentro de Copa Argentina.
+- Incorporó las narrativas al Panel, Mesa de redacción, Visualizaciones y Chat.
+- Amplió a 21 tests automatizados.
+
 # Changelog
 
 ## 3.0.0 · 2026-08-01

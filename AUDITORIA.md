@@ -115,3 +115,16 @@ Cobertura incorporada:
 - La simulación no incorpora lesiones, suspensiones ni mercado.
 - El optimizador exacto necesita SciPy.
 - La interfaz Streamlit debe verificarse en un entorno con sus dependencias instaladas; los módulos y el flujo principal pueden probarse sin navegador.
+
+## Control agregado en v3.3: cupos móviles
+
+La clasificación internacional no debe tratar la posición actual de la Tabla General como una lista definitiva. La identidad de los campeones puede excluir equipos de la carrera por tabla y correr los cortes.
+
+La aplicación ahora distingue:
+
+- corrimiento por un campeón ubicado en zona de copa;
+- plaza adicional por duplicación Apertura-Clausura;
+- sucesión interna de Copa Argentina cuando ARGENTINA 3 no puede quedar en el campeón;
+- corrimiento de la línea de Sudamericana por equipos que pasan a Libertadores.
+
+La lista de equipos vivos de Copa Argentina tiene fecha y fuente visibles. Si está desactualizada, la explicación debe considerarse provisional.

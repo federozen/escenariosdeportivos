@@ -1,4 +1,4 @@
-# Calculadora del Fútbol Argentino · LPF 2026 · versión 3.2
+# Calculadora del Fútbol Argentino · LPF 2026 · versión 3.3
 
 Aplicación editorial en Python y Streamlit para analizar playoffs por zonas, Tabla Anual, Libertadores, Sudamericana, descenso, promedios y escenarios de una fecha.
 
@@ -7,6 +7,17 @@ La versión 3 prioriza tres objetivos:
 1. **Base coherente:** Zonas, Tabla Anual, promedios, fixture y resultados se reconcilian antes de habilitar una cuenta.
 2. **Explicación honesta:** distingue hechos exactos, garantías matemáticas, cotas conservadoras y estimaciones.
 3. **Uso guiado:** ya no es necesario recordar preguntas del chat; el Explorador permite elegir equipo, objetivo y tarea.
+
+## Novedades 3.3
+
+- Relatos de zonas con PTS, PJ, DG, GF, igualdad del corte y tabla resumida.
+- Panoramas narrativos de Libertadores, Sudamericana y descenso.
+- Explicación de cómo los campeones pueden hacer correr los cupos por la Tabla General.
+- Seguimiento editable y cotejable de los equipos vivos en Copa Argentina.
+- Campo para el reemplazo de ARGENTINA 3 cuando la plaza debe heredarse dentro de Copa Argentina.
+- Nuevos accesos guiados para no depender de memorizar preguntas del chat.
+
+Ver `ACTUALIZACION_3_3.md` para el detalle.
 
 ## Instalación
 

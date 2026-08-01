@@ -68,3 +68,18 @@ No corregir una inconsistencia editando solamente la Tabla Anual. Primero compro
 - si la zona está atrasada;
 - si la foto del Apertura fue derivada desde una Anual inconsistente;
 - si un alias generó dos equipos diferentes.
+
+
+## Copa Argentina
+
+La aplicación guarda una foto de los equipos que siguen en competencia porque esa información puede cambiar las líneas de Libertadores y Sudamericana.
+
+En **Datos y auditoría** se puede:
+
+1. editar la lista manualmente;
+2. cotejar partidos pendientes con ESPN;
+3. restaurar la foto de octavos incluida;
+4. abrir el fixture oficial;
+5. registrar al reemplazo de ARGENTINA 3 si el campeón ya tenía plaza.
+
+La fuente oficial debe prevalecer. El cotejo ESPN no se aplica cuando devuelve una fase incompleta.

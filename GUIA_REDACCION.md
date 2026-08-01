@@ -89,3 +89,19 @@ Antes de copiar un informe:
 5. Resultados ajenos relevantes.
 6. Qué cambia en la próxima fecha.
 7. Metodología breve.
+
+
+## Narrativas de competencia
+
+En el Panel por equipo elegí **Panorama narrativo de la competencia**. La vista cambia según el objetivo seleccionado:
+
+- Playoffs: relato completo de la zona y del corte.
+- Libertadores: cupos actuales, primero que espera y condiciones que corren la línea.
+- Sudamericana: seis lugares actuales y formas en que el corte puede bajar.
+- Descenso: Tabla General, Promedios y relación entre ambas vías.
+
+La misma información aparece en Mesa de redacción y Visualizaciones. El chat queda para consultas excepcionales, no como única puerta de entrada.
+
+### Cómo leer los cupos móviles
+
+“Libera un lugar” no siempre significa que la Argentina recibe un cupo adicional. En general significa que un campeón deja de ocupar una plaza por tabla y el siguiente elegible avanza. La duplicación Apertura-Clausura sí agrega un lugar por Tabla General. La duplicación con Copa Argentina se resuelve dentro de esa Copa.
