@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping, Sequence
 
+from lpf_exact import next_round_rank_bounds
+from lpf_scenarios import exact_result_scenarios
+
 
 def _num(value: object, default: int = 0) -> int:
     try:
@@ -64,6 +67,247 @@ def _team_list(items: Sequence[str]) -> str:
     if len(items) == 1:
         return items[0]
     return ", ".join(items[:-1]) + " y " + items[-1]
+
+
+def _rank_label(best: int | None, worst: int | None) -> str:
+    if best is None or worst is None:
+        return "sin rango disponible"
+    if best == worst:
+        return f"{best}º"
+    return f"entre {best}º y {worst}º"
+
+
+def _round_team_snapshot(
+    team: str,
+    zones: Mapping[str, Mapping[str, Mapping[str, object]]],
+    *,
+    cutoff: int,
+) -> dict[str, object] | None:
+    for label, base in zones.items():
+        if team not in base:
+            continue
+        rows = ordered_rows(base)
+        row = next((item for item in rows if item["team"] == team), None)
+        if row is None:
+            return None
+        cut_index = min(max(1, cutoff), len(rows)) - 1
+        cut = rows[cut_index]
+        gap = _num(cut["pts"]) - _num(row["pts"])
+        if _num(row["pos"]) == 1:
+            situation = "lidera"
+        elif _num(row["pos"]) == cutoff:
+            situation = "ocupa el último puesto de clasificación"
+        elif _num(row["pos"]) < cutoff:
+            situation = "está dentro de los puestos de playoffs"
+        elif gap == 0:
+            situation = "está afuera por desempate"
+        elif gap == 1:
+            situation = "está a un punto del corte"
+        else:
+            situation = f"está a {gap} puntos del corte"
+        return {
+            "zone": str(label),
+            "base": base,
+            "row": row,
+            "cut": cut,
+            "situation": situation,
+        }
+    return None
+
+
+def _round_zone_sentence(
+    label: str,
+    base: Mapping[str, Mapping[str, object]],
+    *,
+    cutoff: int,
+) -> str:
+    rows = ordered_rows(base)
+    if not rows:
+        return f"**Zona {label}:** sin datos."
+    cut_index = min(max(1, cutoff), len(rows)) - 1
+    leader = rows[0]
+    cut = rows[cut_index]
+    first_out = rows[cut_index + 1] if cut_index + 1 < len(rows) else None
+    text = (
+        f"**Zona {label}:** {leader['team']} lidera con {leader['pts']} pts y DG {_signed(leader['dg'])}; "
+        f"{cut['team']} marca el corte en el {cutoff}º puesto con {cut['pts']} pts y DG {_signed(cut['dg'])}"
+    )
+    if first_out:
+        text += (
+            f", mientras {first_out['team']} es el primero afuera con {first_out['pts']} pts "
+            f"y DG {_signed(first_out['dg'])}."
+        )
+        if cut["pts"] == first_out["pts"]:
+            text += " Hoy la frontera se define por los criterios de desempate."
+    else:
+        text += "."
+    return text
+
+
+def _round_match_hook(local: dict[str, object], visitor: dict[str, object], *, cutoff: int) -> str:
+    lp = _num(local["row"]["pos"])  # type: ignore[index]
+    vp = _num(visitor["row"]["pos"])  # type: ignore[index]
+    same_zone = local["zone"] == visitor["zone"]
+    if not same_zone:
+        return "Es un interzonal que mueve simultáneamente las dos tablas."
+    if abs(lp - cutoff) <= 2 and abs(vp - cutoff) <= 2:
+        return "Es un cruce directo alrededor del corte de clasificación."
+    if lp <= cutoff and vp <= cutoff:
+        return "Los dos llegan dentro de los puestos de playoffs."
+    if (lp <= cutoff) != (vp <= cutoff):
+        return "Uno defiende un lugar de playoffs y el otro busca meterse en la pelea."
+    if min(lp, vp) <= 3:
+        return "El puntero o uno de sus perseguidores pone en juego la parte alta de la zona."
+    return "Los dos necesitan sumar para acercarse al top 8."
+
+
+def _round_probability_sentence(
+    local: str,
+    visitor: str,
+    probability: Sequence[float] | None,
+) -> str:
+    if not probability or len(probability) < 3:
+        return ""
+    pl, pe, pv = (float(probability[0]), float(probability[1]), float(probability[2]))
+    values = [(pl, local), (pv, visitor)]
+    values.sort(reverse=True)
+    favorite = values[0]
+    if favorite[0] < 0.40 or abs(pl - pv) < 0.08:
+        lead = "El modelo no marca un favorito fuerte"
+    else:
+        lead = f"El modelo da una leve ventaja a {favorite[1]}"
+    return f"{lead} ({round(100 * pl)}% local, {round(100 * pe)}% empate, {round(100 * pv)}% visita)."
+
+
+def _round_result_branch(
+    team: str,
+    base: Mapping[str, Mapping[str, object]],
+    games: Sequence[tuple[str, str]],
+    own_match: tuple[str, str],
+    *,
+    cutoff: int,
+) -> str:
+    relevant_games = [match for match in games if match[0] in base or match[1] in base]
+    rows = exact_result_scenarios(base, relevant_games, team, own_match, cutoff)
+    if not rows or any(row.get("best_rank") is None or row.get("worst_rank") is None for row in rows):
+        return ""
+    labels = []
+    for row in rows:
+        labels.append(
+            f"si {str(row['result']).lower()}, {_rank_label(int(row['best_rank']), int(row['worst_rank']))}"
+        )
+    return f"**{team}:** " + "; ".join(labels) + "."
+
+
+def round_preview_story(
+    zones: Mapping[str, Mapping[str, Mapping[str, object]]],
+    games: Sequence[tuple[str, str]],
+    *,
+    round_label: str,
+    cutoff: int = 8,
+    match_types: Mapping[tuple[str, str], tuple[str, str | None]] | None = None,
+    probabilities: Mapping[tuple[str, str], Sequence[float]] | None = None,
+    postponed_rounds: Mapping[tuple[str, str], int] | None = None,
+    selected_match: tuple[str, str] | None = None,
+    detailed: bool = False,
+) -> str:
+    """Narrativa breve para toda una fecha o para un partido puntual.
+
+    La vista general usa la foto actual, el corte y un rango rápido de puesto para
+    los equipos que juegan una sola vez en la ventana. La vista por partido puede
+    agregar las ramas exactas gana/empata/pierde del motor MILP.
+    """
+    if not games:
+        return "No hay partidos pendientes en la fecha seleccionada."
+    match_types = dict(match_types or {})
+    probabilities = dict(probabilities or {})
+    postponed_rounds = dict(postponed_rounds or {})
+    appearances = {team: sum(team in match for match in games) for base in zones.values() for team in base}
+
+    def match_order(match: tuple[str, str]) -> tuple[object, ...]:
+        kind, zone = match_types.get(match, ("zona", None))
+        return (1 if match in postponed_rounds else 0, 0 if kind == "zona" else 1, zone or "Z", match[0])
+
+    ordered_games = sorted(games, key=match_order)
+    if selected_match is not None:
+        ordered_games = [selected_match] if selected_match in games else []
+        if not ordered_games:
+            return "El partido elegido no pertenece a la fecha seleccionada."
+
+    blocks: list[str] = []
+    if selected_match is None:
+        blocks.append(f"## {round_label} — pantallazo general")
+        blocks.append(
+            f"La ventana reúne **{len(games)} partidos**. Cada resultado mueve la zona correspondiente y también suma "
+            "para la Tabla Anual, por lo que después impacta en copas y descenso."
+        )
+        for label in sorted(zones):
+            blocks.append(_round_zone_sentence(str(label), zones[label], cutoff=cutoff))
+        blocks.append("### Partido por partido")
+    else:
+        blocks.append(f"## {round_label} — partido elegido")
+
+    for local, visitor in ordered_games:
+        local_snapshot = _round_team_snapshot(local, zones, cutoff=cutoff)
+        visitor_snapshot = _round_team_snapshot(visitor, zones, cutoff=cutoff)
+        if local_snapshot is None or visitor_snapshot is None:
+            blocks.append(f"**{local} – {visitor}.** No hay datos suficientes para narrar este encuentro.")
+            continue
+        kind, zone = match_types.get((local, visitor), ("zona", None))
+        type_label = f"Zona {zone}" if kind == "zona" and zone else "Interzonal"
+        postponed = postponed_rounds.get((local, visitor))
+        timing = f" · postergado de la Fecha {postponed}" if postponed is not None else ""
+        lr = local_snapshot["row"]
+        vr = visitor_snapshot["row"]
+        paragraph = [f"**{local} – {visitor} ({type_label}{timing}).**"]
+        paragraph.append(
+            f"{local} llega {lr['pos']}º de la Zona {local_snapshot['zone']} con {lr['pts']} pts y DG {_signed(lr['dg'])}; "
+            f"{visitor}, {vr['pos']}º de la Zona {visitor_snapshot['zone']} con {vr['pts']} pts y DG {_signed(vr['dg'])}."
+        )
+        paragraph.append(_round_match_hook(local_snapshot, visitor_snapshot, cutoff=cutoff))
+
+        ranges = []
+        for team, snapshot in ((local, local_snapshot), (visitor, visitor_snapshot)):
+            if appearances.get(team, 0) != 1:
+                ranges.append(f"{team} juega dos veces en la ventana")
+                continue
+            base = snapshot["base"]
+            zone_games = [match for match in games if match[0] in base or match[1] in base]
+            bounds = next_round_rank_bounds(team, base, zone_games)
+            if bounds:
+                ranges.append(f"{team} puede cerrar {_rank_label(bounds[0], bounds[1])}")
+        if ranges:
+            paragraph.append("Al final de la ventana, " + "; ".join(ranges) + ".")
+
+        if selected_match is not None or detailed:
+            prob_sentence = _round_probability_sentence(local, visitor, probabilities.get((local, visitor)))
+            if prob_sentence:
+                paragraph.append(prob_sentence)
+        blocks.append(" ".join(part for part in paragraph if part))
+
+        if detailed:
+            local_branch = _round_result_branch(
+                local, local_snapshot["base"], games, (local, visitor), cutoff=cutoff
+            )
+            visitor_branch = _round_result_branch(
+                visitor, visitor_snapshot["base"], games, (local, visitor), cutoff=cutoff
+            )
+            if local_branch:
+                blocks.append(local_branch)
+            if visitor_branch:
+                blocks.append(visitor_branch)
+
+    if detailed:
+        blocks.append(
+            "_Las ramas gana/empata/pierde son exactas por puntos. Si hay igualdad, el rango contempla un desempate "
+            "favorable o adverso: no inventa diferencia de gol futura._"
+        )
+    elif selected_match is None:
+        blocks.append(
+            "_El rango de puesto es exacto por puntos para los equipos que disputan un solo partido en la ventana. "
+            "Las probabilidades son una estimación separada y no modifican las cuentas._"
+        )
+    return "\n\n".join(blocks)
 
 
 def _tiebreak_between(above: Mapping[str, object], below: Mapping[str, object]) -> str:

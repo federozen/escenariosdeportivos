@@ -1,3 +1,14 @@
+## 3.4
+
+- Agregó un pantallazo narrativo de la fecha completa dentro de **Mesa de redacción → Previa de la fecha**.
+- Incorporó el selector **Toda la fecha / Un partido**.
+- La vista general resume ambas zonas y luego recorre todos los encuentros con contexto de tabla y rango de puestos.
+- La vista por partido agrega ramas exactas gana/empata/pierde para los dos equipos.
+- Los postergados quedan marcados con su fecha original.
+- Si un equipo juega dos veces en la ventana, la vista general evita mostrar un rango simplificado engañoso; la vista individual usa el motor exacto.
+- Las probabilidades se mantienen como bloque estimado separado.
+- Total de la entrega: 23 tests automatizados aprobados.
+
 ## 3.3
 
 - Mejoró la narrativa de Zona A y Zona B con PJ, DG, GF, igualdad del corte, distancias y tabla breve.

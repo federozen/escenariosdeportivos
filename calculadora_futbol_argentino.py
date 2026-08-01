@@ -15,7 +15,7 @@ from lpf_data_quality import (
 )
 from lpf_models import AuditIssue, DataQualityReport
 from lpf_competition_narratives import (
-    libertadores_story, relegation_story, sudamericana_story, zone_story,
+    libertadores_story, relegation_story, round_preview_story, sudamericana_story, zone_story,
 )
 from lpf_scenarios import exact_result_scenarios, point_ladder, scenario_rank_bounds, best_worst_window_scenarios, exact_rank_bounds_with_points, reachable_point_totals
 # El núcleo exacto vive en lpf_exact.py. Si ese archivo no está junto a este
@@ -5638,6 +5638,37 @@ def lpf_previa_fecha_sim(Z, rest, pend, jugados=None, fecha=None):
                      "Gana visita %": round(100 * pv)})
     return prox, pd.DataFrame(rows)
 
+
+def lpf_previa_fecha_narrativa(Z, rest, pend, jugados=None, fecha=None, partido=None):
+    """Texto editorial breve para toda la fecha o para un encuentro puntual.
+
+    Reutiliza la misma ventana que la pestaña de resultados: fecha oficial más
+    postergados anteriores. La vista general evita cálculos pesados por partido;
+    la vista individual activa las ramas exactas gana/empata/pierde.
+    """
+    prox, official_games, postponed = lpf_jornada_actual(pend, forzar=fecha)
+    if prox is None:
+        return "No quedan partidos pendientes."
+    games = list(official_games) + [match for match, _round in postponed]
+    base_all = {team: data for base in (Z or {}).values() for team, data in base.items()}
+    strength = _fuerza_lpf(base_all, jugados)
+    probabilities = {
+        match: _lpf_prob_partido(match[0], match[1], strength)
+        for match in games
+    }
+    postponed_rounds = {match: round_number for match, round_number in postponed}
+    return round_preview_story(
+        Z,
+        games,
+        round_label=lpf_etiqueta_jornada(prox, postponed),
+        cutoff=_LPF_TOP_OCTAVOS,
+        match_types=_lpf_tipo_de(),
+        probabilities=probabilities,
+        postponed_rounds=postponed_rounds,
+        selected_match=partido,
+        detailed=partido is not None,
+    )
+
 def _sim_zone_pos(base, rest, pend, target, n, seed, forced=None,
                   pdraw=_LPF_PDRAW, loc=_LPF_LOCALIA, jugados=None):
     """Array (n,) con la posición final de `target` dentro de su zona, simulando
@@ -7735,6 +7766,39 @@ def render_newsroom(E):
                     st.info(f"Hay {len(_atr2)} partido(s) postergado(s) de fecha(s) anterior(es). "
                             f"Los incluyo abajo, marcados como **Postergado**, porque se juegan en esta ventana.")
         if next_games:
+            st.markdown("##### Narrativa para la previa")
+            _narrative_mode = st.radio(
+                "Alcance del relato",
+                ["Toda la fecha", "Un partido"],
+                horizontal=True,
+                key="rd_preview_narrative_mode",
+            )
+            _narrative_match = None
+            if _narrative_mode == "Un partido":
+                _postponed_lookup = {match: round_number for match, round_number in _atr2}
+
+                def _preview_match_label(match):
+                    _post = _postponed_lookup.get(match)
+                    _suffix = f" · postergado F{_post}" if _post is not None else ""
+                    return f"{match[0]} – {match[1]}{_suffix}"
+
+                _narrative_match = st.selectbox(
+                    "Partido",
+                    next_games,
+                    format_func=_preview_match_label,
+                    key="rd_preview_narrative_match",
+                )
+            _narrative_text = lpf_previa_fecha_narrativa(
+                Z,
+                rest,
+                pending,
+                E.get("jugados") or [],
+                fecha=_sel,
+                partido=_narrative_match,
+            )
+            st.markdown(_narrative_text)
+
+            st.markdown("##### Probabilidades de los partidos")
             date, matches_df = lpf_previa_fecha_sim(Z, rest, pending, E.get("jugados") or [], fecha=_sel)
             if matches_df is not None:
                 st.dataframe(matches_df, use_container_width=True, hide_index=True)
