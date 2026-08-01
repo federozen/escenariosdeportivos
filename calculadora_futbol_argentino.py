@@ -1,0 +1,7383 @@
+"""
+⚽ Calculadora de escenarios — LPF 2026
+Convertido de Jupyter Notebook (v2) a Streamlit
+"""
+
+import streamlit as st
+from itertools import product, combinations
+import pandas as pd
+import numpy as np
+import re
+import requests
+# El núcleo exacto vive en lpf_exact.py. Si ese archivo no está junto a este
+# (por ejemplo, si se subió sólo este .py al repo), se usa la copia espejo de
+# abajo para que la app funcione igual. Mantener ambas versiones sincronizadas.
+try:
+    from lpf_exact import next_round_rank_bounds, safe_guarantee_line
+except ModuleNotFoundError:
+    _LPF_EXACT_ESPEJO = r'''
+"""Núcleo exacto y auditable para las cuentas sensibles de la LPF.
+
+No importa Streamlit ni usa azar. Las funciones de este módulo se pueden probar
+por separado de la interfaz.
+"""
+
+from __future__ import annotations
+
+from itertools import combinations
+from typing import Iterable, Mapping, Sequence
+
+
+def _points(value: object) -> int:
+    if isinstance(value, Mapping):
+        return int(value.get("pts", 0))
+    return int(value)
+
+
+def safe_guarantee_line(
+    base: Mapping[str, object],
+    remaining: Mapping[str, int],
+    matches: Iterable[tuple[str, str]],
+    team: str,
+    rivals_above: int,
+) -> int:
+    """Cota superior segura para el puntaje del rival k-ésimo.
+
+    Devuelve el mayor ``P`` para el que *todavía es posible* que al menos ``k``
+    rivales terminen con ``P`` puntos. Por eso, terminar con ``P + 1`` garantiza
+    quedar por encima de ese grupo (sin depender de desempates).
+
+    La relajación descuenta correctamente los partidos entre los rivales elegidos:
+    cada uno aparece dos veces en la suma de partidos restantes, pero reparte como
+    máximo tres puntos en total. Se prueban todos los subconjuntos relevantes, no
+    sólo los equipos con mayor techo. La prueba es necesaria, no suficiente; puede
+    pedir algún punto de más, pero nunca declarar una garantía falsa.
+    """
+    rivals = [name for name in base if name != team]
+    k = int(rivals_above)
+    if k <= 0:
+        return -1
+    if len(rivals) < k:
+        return -1
+
+    pts = {name: _points(value) for name, value in base.items()}
+    games_left = {name: max(0, int(remaining.get(name, 0))) for name in base}
+    relevant_edges = [
+        (a, b)
+        for a, b in matches
+        if a in base and b in base and a != team and b != team
+    ]
+    ceilings = {name: pts[name] + 3 * games_left[name] for name in rivals}
+
+    def relaxed_feasible(target_points: int) -> bool:
+        candidates = [name for name in rivals if ceilings[name] >= target_points]
+        if len(candidates) < k:
+            return False
+
+        # Los candidatos más ajustados primero suelen descartar antes; en los casos
+        # fáciles la función sale con el primer subconjunto factible.
+        candidates.sort(key=lambda name: (ceilings[name], -pts[name]))
+        edge_set = {frozenset((a, b)) for a, b in relevant_edges}
+        for chosen in combinations(candidates, k):
+            deficits = [max(0, target_points - pts[name]) for name in chosen]
+            if any(deficit > 3 * games_left[name] for name, deficit in zip(chosen, deficits)):
+                continue
+            internal = sum(
+                1 for a, b in combinations(chosen, 2) if frozenset((a, b)) in edge_set
+            )
+            # Cada cruce interno fue contado dos veces en sum(g); se resta una
+            # capacidad de tres puntos para dejar el máximo real del partido.
+            capacity = 3 * sum(games_left[name] for name in chosen) - 3 * internal
+            if sum(deficits) <= capacity:
+                return True
+        return False
+
+    low = min(pts.values(), default=0)
+    high = max(ceilings.values(), default=0)
+    answer = low - 1
+    while low <= high:
+        middle = (low + high) // 2
+        if relaxed_feasible(middle):
+            answer = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return answer
+
+
+def next_round_rank_bounds(
+    target: str,
+    table: Mapping[str, Mapping[str, int]],
+    games: Sequence[tuple[str, str]],
+) -> tuple[int, int] | None:
+    """Mejor y peor puesto posible tras una fecha, sin fingir un desempate.
+
+    La frontera se calcula por puntos. En el mejor caso, un empate en puntos puede
+    favorecer al equipo; en el peor, puede perjudicarlo. Ese intervalo incluye los
+    marcadores y los criterios reglamentarios todavía desconocidos (fair play o
+    sorteo). Dos rivales que se enfrentan se evalúan juntos, así que no se les
+    adjudican simultáneamente tres puntos.
+    """
+    if target not in table:
+        return None
+
+    current = {name: int(stats.get("pts", 0)) for name, stats in table.items()}
+    target_best = current[target] + 3
+    target_worst = current[target]
+    best_above = 0
+    worst_above = 0
+    seen = {target}
+
+    for local, visitor in games:
+        if target in (local, visitor):
+            opponent = visitor if local == target else local
+            if opponent in current:
+                seen.add(opponent)
+                best_above += int(current[opponent] > target_best)
+                worst_above += int(current[opponent] + 3 >= target_worst)
+            continue
+
+        in_local = local in current
+        in_visitor = visitor in current
+        if in_local and in_visitor:
+            seen.update((local, visitor))
+            outcomes = ((3, 0), (1, 1), (0, 3))
+            best_above += min(
+                int(current[local] + dl > target_best)
+                + int(current[visitor] + dv > target_best)
+                for dl, dv in outcomes
+            )
+            worst_above += max(
+                int(current[local] + dl >= target_worst)
+                + int(current[visitor] + dv >= target_worst)
+                for dl, dv in outcomes
+            )
+        elif in_local or in_visitor:
+            rival = local if in_local else visitor
+            seen.add(rival)
+            best_above += min(int(current[rival] + add > target_best) for add in (3, 1, 0))
+            worst_above += max(int(current[rival] + add >= target_worst) for add in (3, 1, 0))
+
+    for rival in current:
+        if rival not in seen:
+            best_above += int(current[rival] > target_best)
+            worst_above += int(current[rival] >= target_worst)
+
+    return best_above + 1, worst_above + 1
+'''
+    _ns_exact = {}
+    exec(compile(_LPF_EXACT_ESPEJO, 'lpf_exact_espejo.py', 'exec'), _ns_exact)
+    next_round_rank_bounds = _ns_exact['next_round_rank_bounds']
+    safe_guarantee_line = _ns_exact['safe_guarantee_line']
+
+# ─── CONFIG ─────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="⚽ Calculadora del Fútbol Argentino",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+.main-header {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    padding: 2rem 2rem 1.5rem;
+    border-radius: 12px;
+    margin-bottom: 1.5rem;
+    border-left: 4px solid #e94560;
+}
+.main-header h1 { color: white; font-size: 2rem; font-weight: 700; margin: 0; }
+.main-header p  { color: #a0aec0; margin: 0.3rem 0 0; font-size: 0.95rem; }
+div[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── CONSTANTES CONFIGURABLES ────────────────────────────────────────────────────
+PRESETS = {
+    "LPF 2026 — DG, GF, mano a mano, fair play (Reglamento art. 16)": ["dg","gf","h2h_pts","h2h_dg","h2h_gf","fair_play"],
+    "Olímpico — mano a mano primero (FIFA, Euro, La Liga, Serie A)": ["h2h_pts","h2h_dg","h2h_gf","dg","gf"],
+    "Diferencia de gol primero (Premier, Bundesliga, Champions fase liga)": ["dg","gf"],
+    "Solo puntos (sin desempate fino)": [],
+}
+
+if "CRITERIOS"          not in st.session_state: st.session_state.CRITERIOS          = ["dg","gf","h2h_pts","h2h_dg","h2h_gf","fair_play"]
+if "DIRECTO"            not in st.session_state: st.session_state.DIRECTO            = 2
+if "MEJORES_TERCEROS"   not in st.session_state: st.session_state.MEJORES_TERCEROS   = 0
+if "CAMPEON"            not in st.session_state: st.session_state.CAMPEON            = "campeón"
+if "ESTADO"             not in st.session_state: st.session_state.ESTADO             = {}
+if "texto_torneo_cache" not in st.session_state: st.session_state.texto_torneo_cache = ""
+if "ZONAS"              not in st.session_state: st.session_state.ZONAS              = []
+if "ZONAS_TXT"          not in st.session_state: st.session_state.ZONAS_TXT          = ""
+
+def _secret(k, default=""):
+    try:
+        return st.secrets.get(k, default)
+    except Exception:
+        return default
+
+def DIRECTO():          return st.session_state.DIRECTO
+def MEJORES_TERCEROS(): return st.session_state.MEJORES_TERCEROS
+def CAMPEON():          return st.session_state.CAMPEON
+def CRITERIOS():        return st.session_state.CRITERIOS
+
+# ─── MOTOR ──────────────────────────────────────────────────────────────────────
+def fixture_completo(equipos): return list(combinations(equipos, 2))
+
+def _stats(equipos, partidos):
+    st_d = {e: {"pts": 0, "gf": 0, "ga": 0, "pj": 0} for e in equipos}
+    for l, v, gl, gv in partidos:
+        st_d[l]["gf"] += gl; st_d[l]["ga"] += gv; st_d[l]["pj"] += 1
+        st_d[v]["gf"] += gv; st_d[v]["ga"] += gl; st_d[v]["pj"] += 1
+        if gl > gv: st_d[l]["pts"] += 3
+        elif gl < gv: st_d[v]["pts"] += 3
+        else: st_d[l]["pts"] += 1; st_d[v]["pts"] += 1
+    for e in st_d: st_d[e]["dg"] = st_d[e]["gf"] - st_d[e]["ga"]
+    return st_d
+
+def _stats_entre(teams, partidos):
+    ts = set(teams)
+    st_d = {e: {"pts": 0, "gf": 0, "ga": 0} for e in teams}
+    for l, v, gl, gv in partidos:
+        if l in ts and v in ts:
+            st_d[l]["gf"] += gl; st_d[l]["ga"] += gv
+            st_d[v]["gf"] += gv; st_d[v]["ga"] += gl
+            if gl > gv: st_d[l]["pts"] += 3
+            elif gl < gv: st_d[v]["pts"] += 3
+            else: st_d[l]["pts"] += 1; st_d[v]["pts"] += 1
+    for e in st_d: st_d[e]["dg"] = st_d[e]["gf"] - st_d[e]["ga"]
+    return st_d
+
+def _resolver(teams, partidos, overall, fair_play, ranking):
+    criterios = CRITERIOS()
+    if len(teams) <= 1: return list(teams)
+    h = _stats_entre(teams, partidos) if any(c.startswith("h2h") for c in criterios) else None
+    def val(c):
+        if c == "h2h_pts": return {e: h[e]["pts"] for e in teams}
+        if c == "h2h_dg":  return {e: h[e]["dg"]  for e in teams}
+        if c == "h2h_gf":  return {e: h[e]["gf"]  for e in teams}
+        if c == "dg":      return {e: overall[e]["dg"] for e in teams}
+        if c == "gf":      return {e: overall[e]["gf"] for e in teams}
+        if c == "fair_play" and fair_play is not None: return {e: fair_play.get(e, 0) for e in teams}
+        if c == "ranking"   and ranking   is not None: return {e: -ranking.get(e, 9999) for e in teams}
+        return None
+    for c in criterios:
+        vals = val(c)
+        if vals is None: continue
+        if len(set(vals.values())) > 1:
+            out = []
+            for v in sorted(set(vals.values()), reverse=True):
+                out += _resolver([e for e in teams if vals[e] == v], partidos, overall, fair_play, ranking)
+            return out
+    return sorted(teams)
+
+def _orden(equipos, partidos, fair_play=None, ranking=None):
+    overall = _stats(equipos, partidos); porpts = {}
+    for e in equipos: porpts.setdefault(overall[e]["pts"], []).append(e)
+    orden = []
+    for pts in sorted(porpts, reverse=True):
+        orden += _resolver(porpts[pts], partidos, overall, fair_play, ranking)
+    return orden, overall
+
+def posiciones(equipos, partidos, fair_play=None, ranking=None):
+    orden, _ = _orden(equipos, partidos, fair_play, ranking)
+    return {e: i for i, e in enumerate(orden, 1)}
+
+def tabla(equipos, partidos, fair_play=None, ranking=None):
+    orden, ov = _orden(equipos, partidos, fair_play, ranking)
+    return pd.DataFrame([{"Pos": i, "Equipo": e, "PJ": ov[e]["pj"], "PTS": ov[e]["pts"],
+                          "GF": ov[e]["gf"], "GC": ov[e]["ga"], "DG": ov[e]["dg"]}
+                         for i, e in enumerate(orden, 1)])
+
+def simular(equipos, jugados, pendientes, resultados, fair_play=None, ranking=None):
+    part = list(jugados) + [(l, v, gl, gv) for (l, v), (gl, gv) in zip(pendientes, resultados)]
+    return tabla(equipos, part, fair_play, ranking)
+
+def texto_resultados(pend, res):
+    return " | ".join(f"{l} {gl}-{gv} {v}" for (l, v), (gl, gv) in zip(pend, res))
+
+def elegir_max_goles(n_pend, tope=300000):
+    for mg in (5, 4, 3, 2, 1):
+        if (mg + 1) ** (2 * n_pend) <= tope: return mg
+    return 1
+
+def todos_los_escenarios(equipos, jugados, pendientes, max_goles=None, fair_play=None, ranking=None):
+    if max_goles is None: max_goles = elegir_max_goles(len(pendientes))
+    posib = list(product(range(max_goles + 1), repeat=2)); filas = []
+    for res in product(posib, repeat=len(pendientes)):
+        t = simular(equipos, jugados, pendientes, res, fair_play, ranking)
+        fila = {"Resultados": texto_resultados(pendientes, res)}
+        for i, ((l, v), (gl, gv)) in enumerate(zip(pendientes, res), 1):
+            fila[f"P{i}_local"] = l; fila[f"P{i}_vis"] = v; fila[f"P{i}_gl"] = gl; fila[f"P{i}_gv"] = gv
+        for _, r in t.iterrows():
+            e = r["Equipo"]; fila[f"Pos {e}"] = r["Pos"]; fila[f"PTS {e}"] = r["PTS"]
+            fila[f"DG {e}"] = r["DG"]; fila[f"GF {e}"] = r["GF"]
+        filas.append(fila)
+    return pd.DataFrame(filas)
+
+# ─── ANÁLISIS ───────────────────────────────────────────────────────────────────
+def _pd_de(equipo, pend): return [(i, l, v) for i, (l, v) in enumerate(pend, 1) if equipo in (l, v)]
+
+def _res_propio(row, equipo, pend):
+    et = []
+    for i, l, v in _pd_de(equipo, pend):
+        gl, gv = row[f"P{i}_gl"], row[f"P{i}_gv"]
+        gf, gc = (gl, gv) if l == equipo else (gv, gl); riv = v if l == equipo else l
+        et.append(f"le gana a {riv}" if gf > gc else (f"pierde con {riv}" if gf < gc else f"empata con {riv}"))
+    return " y ".join(et)
+
+def _res_otros(row, equipo, pend):
+    et = []; mios = {i for i, _, _ in _pd_de(equipo, pend)}
+    for i, (l, v) in enumerate(pend, 1):
+        if i in mios: continue
+        gl, gv = row[f"P{i}_gl"], row[f"P{i}_gv"]
+        et.append(f"gana {l}" if gl > gv else (f"gana {v}" if gl < gv else f"empatan {l} y {v}"))
+    return " y ".join(et) if et else "(no hay otros partidos)"
+
+def _combo(row, pend):
+    parts = []
+    for i, (l, v) in enumerate(pend, 1):
+        gl, gv = row[f"P{i}_gl"], row[f"P{i}_gv"]
+        parts.append(f"gana {l}" if gl > gv else (f"gana {v}" if gl < gv else f"empatan {l} y {v}"))
+    return " · ".join(parts)
+
+def _margen_pend(eq, pend, row):
+    m = 0; opp = None
+    for i, l, v in _pd_de(eq, pend):
+        gl, gv = row[f"P{i}_gl"], row[f"P{i}_gv"]
+        m += (gl - gv) if l == eq else (gv - gl)
+        opp = v if l == eq else l
+    return m, opp
+
+def _gol(k): return f"{abs(k)} gol" + ("es" if abs(k) != 1 else "")
+
+def _detalle_gol(g2, equipo, pend):
+    """Describe exactamente cuántos goles necesita para superar a un rival en desempate."""
+    fila = g2.iloc[0]; Pe = fila[f"PTS {equipo}"]
+    teams = [c[4:] for c in g2.columns if c.startswith("PTS ")]
+    rivales = [t for t in teams if t != equipo and g2[f"PTS {t}"].iloc[0] == Pe]
+    if len(rivales) != 1:
+        extra = f" (igualado en {int(Pe)} pts con {', '.join(rivales)})" if rivales else ""
+        return f"depende de la diferencia de gol{extra}"
+    riv = rivales[0]
+    me0, opp = _margen_pend(equipo, pend, fila); mr0, _ = _margen_pend(riv, pend, fila)
+    de = int(fila[f"DG {equipo}"]) - me0; dr = int(fila[f"DG {riv}"]) - mr0
+    gap = dr - de; K = gap + 1; riv_pend = bool(_pd_de(riv, pend))
+    solo_e = len(_pd_de(equipo, pend)) == 1; solo_r = len(_pd_de(riv, pend)) == 1
+    if me0 > 0 and solo_e and solo_r:
+        if K >= 2:
+            return (f"necesita ganarle a {opp} por al menos {_gol(K)} más que {riv}; "
+                    f"si gana por {_gol(K-1)} más, igualan en diferencia de gol y se define por los goles a favor")
+        if K == 1:
+            return (f"necesita ganarle a {opp} por al menos 1 gol más que {riv}; "
+                    f"si ganan por la misma diferencia, igualan en DG y se define por los goles a favor")
+        return (f"le alcanza con que su diferencia de gol final supere a la de {riv} (parte {_gol(-gap)} arriba); "
+                f"si {riv} la empareja, se define por los goles a favor")
+    if me0 > 0 and solo_e and not riv_pend and K >= 1:
+        cola = (f"con {_gol(K-1)} igualan en DG y define los goles a favor" if K - 1 >= 1
+                else "si igualan la DG, define los goles a favor")
+        return f"necesita ganar por al menos {_gol(K)} para superar la diferencia de gol de {riv}; {cola}"
+    return (f"necesita terminar con mejor diferencia de gol que {riv} "
+            f"(hoy {equipo} {de:+d} y {riv} {dr:+d}); si igualan, se define por los goles a favor")
+
+def situacion(equipo, esc, directo=None):
+    d = DIRECTO() if directo is None else directo
+    pos = esc[f"Pos {equipo}"]
+    vivo = 3 if MEJORES_TERCEROS() > 0 else d
+    return {"mejor": int(pos.min()), "peor": int(pos.max()), "total": len(esc),
+            "n1": int((pos == 1).sum()), "ndir": int((pos <= d).sum()),
+            "ntercero": int((pos == 3).sum()), "ntop3": int((pos <= 3).sum()),
+            "ya_1": bool((pos == 1).all()), "ya_directo": bool((pos <= d).all()),
+            "puede_1": bool((pos == 1).any()), "puede_directo": bool((pos <= d).any()),
+            "puede_tercero": bool((pos == 3).any()), "asegura_vivo": bool((pos <= vivo).all()),
+            "eliminado": bool((pos > vivo).all()), "vivo": vivo, "directo": d}
+
+def que_necesita_texto(equipo, esc, pend, objetivo="directo", directo=None, n=2):
+    d = DIRECTO() if directo is None else directo
+    pos = esc[f"Pos {equipo}"]
+    T = sum(1 for c in esc.columns if c.startswith("Pos "))
+    if objetivo in ("primero", "campeon"):
+        ok = (pos == 1); verbo = f"es {CAMPEON()}"
+    elif objetivo == "top3":
+        ok = (pos <= 3); verbo = "queda 3º o mejor"
+    elif objetivo == "tercero":
+        ok = (pos == 3); verbo = "queda 3º"
+    elif objetivo == "top":
+        ok = (pos <= n); verbo = f"entra al top {n}"
+    elif objetivo == "exacto":
+        ok = (pos == n); verbo = f"queda {n}º"
+    elif objetivo == "descenso":
+        corte = T - n; ok = (pos <= corte); verbo = "se salva"
+    else:
+        ok = (pos <= d); verbo = "clasifica"
+    df = esc.copy()
+    df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+    df["_o"] = df.apply(lambda r: _res_otros(r, equipo, pend), axis=1)
+    df["_ok"] = ok.values
+    lineas = []
+    for prop, g in sorted(df.groupby("_p"), key=lambda kv: -kv[1]["_ok"].mean()):
+        m, k = len(g), int(g["_ok"].sum())
+        cab = "✅ SEGURO" if k == m else ("❌ IMPOSIBLE" if k == 0 else "⚠️ DEPENDE")
+        lineas.append(f"**• Si {equipo} {prop}:** {cab}")
+        if 0 < k < m:
+            for otros, g2 in sorted(g.groupby("_o"), key=lambda kv: -kv[1]["_ok"].mean()):
+                n2, k2 = len(g2), int(g2["_ok"].sum())
+                if k2 == n2:
+                    e = f"→ {verbo} ✅"
+                elif k2 == 0:
+                    e = f"→ no {verbo} ❌"
+                else:
+                    detalle = _detalle_gol(g2, equipo, pend)
+                    e = f"→ {detalle} ⚠️"
+                lineas.append(f"&nbsp;&nbsp;&nbsp;&nbsp;· y {otros}: {e}")
+    return "\n\n".join(lineas)
+
+def apartado_terceros_texto(equipo, esc, pend):
+    if MEJORES_TERCEROS() <= 0:
+        return ""
+    pos = esc[f"Pos {equipo}"]; n3 = int((pos == 3).sum())
+    lineas = ["**— MEJOR TERCERO —**"]
+    if n3 == 0:
+        lineas.append(f"{equipo} no termina 3º en ningún escenario.")
+        return "\n\n".join(lineas)
+    lineas.append(f"⚠️ Quedar 3º **NO** asegura clasificar: entran los **{MEJORES_TERCEROS()} mejores terceros** del torneo, "
+                  f"así que depende de lo que pase en los otros grupos.")
+    lineas.append(f"{equipo} termina 3º en **{n3}/{len(esc)}** escenarios.")
+    lineas.append(que_necesita_texto(equipo, esc, pend, "tercero"))
+    return "\n\n".join(lineas)
+
+def _cab_completo(g, d, hay3):
+    pmin, pmax = int(g["_pos"].min()), int(g["_pos"].max())
+    if pmax <= d:            return "✅ CLASIFICA DIRECTO"
+    if pmin <= d:            return "⚠️ DEPENDE (puede entrar directo)"
+    if hay3 and pmax <= 3:   return "⚠️ A LO SUMO 3º (depende de otros grupos)"
+    if hay3 and pmin <= 3:   return "⚠️ DEPENDE (3º o afuera)"
+    return "❌ QUEDA AFUERA"
+
+def _meaning_pos(equipo, g2, pend, d, hay3):
+    pmin, pmax = int(g2["_pos"].min()), int(g2["_pos"].max())
+    rng = f"{pmin}º" if pmin == pmax else f"{pmin}º-{pmax}º"
+    if pmax <= d:
+        return f"→ {rng} · clasifica directo ✅"
+    if pmin <= d:
+        cola = "si no, 3º (depende de otros grupos)" if hay3 else "si no, afuera"
+        return f"→ {rng} · directo según diferencia de gol; {cola} ⚠️"
+    if hay3 and pmax <= 3:
+        return "→ 3º · entra solo si es de los mejores terceros (depende de otros grupos) ⚠️"
+    if hay3 and pmin <= 3:
+        return "→ 3º o peor · si es 3º depende de otros grupos; si no, afuera ⚠️"
+    return f"→ {rng} · afuera ❌"
+
+def que_necesita_completo_texto(equipo, esc, pend):
+    """Árbol único: para cada resultado propio muestra el puesto final (directo / 3º que depende / afuera)."""
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    df = esc.copy()
+    df["_pos"] = esc[f"Pos {equipo}"].values
+    df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+    df["_o"] = df.apply(lambda r: _res_otros(r, equipo, pend), axis=1)
+    lineas = []
+    for prop, g in sorted(df.groupby("_p"), key=lambda kv: kv[1]["_pos"].mean()):
+        lineas.append(f"**• Si {equipo} {prop}:** {_cab_completo(g, d, hay3)}")
+        uniforme = int(g["_pos"].min()) == int(g["_pos"].max())
+        grupos_otros = sorted(g.groupby("_o"), key=lambda kv: kv[1]["_pos"].mean())
+        if not uniforme:
+            if len(grupos_otros) > 1:
+                for otros, g2 in grupos_otros:
+                    lineas.append(f"&nbsp;&nbsp;&nbsp;&nbsp;· y {otros}: {_meaning_pos(equipo, g2, pend, d, hay3)}")
+            else:
+                lineas.append(f"&nbsp;&nbsp;&nbsp;&nbsp;{_meaning_pos(equipo, g, pend, d, hay3)}")
+    return "\n\n".join(lineas)
+
+def _mask_gana_todos(esc, equipo, pend):
+    mask = pd.Series(True, index=esc.index)
+    for i, l, v in _pd_de(equipo, pend):
+        gl, gv = esc[f"P{i}_gl"], esc[f"P{i}_gv"]
+        mask &= (gl > gv) if l == equipo else (gv > gl)
+    return mask
+
+def en_sus_manos(equipo, esc, pend):
+    """Devuelve (categoría, frase) sobre si el equipo depende de sí mismo."""
+    s = situacion(equipo, esc); d = DIRECTO()
+    if s["ya_directo"]: return ("ya", "ya está clasificado directo, pase lo que pase")
+    if s["eliminado"]: return ("out", "ya no puede clasificar en ningún escenario")
+    own = _pd_de(equipo, pend)
+    if not own:
+        return ("ayuda", "ya jugó todos sus partidos: su suerte depende solo de los otros")
+    mask = _mask_gana_todos(esc, equipo, pend)
+    pos = esc[f"Pos {equipo}"]
+    n = "su partido" if len(own) == 1 else "todos sus partidos"
+    peor = int(pos[mask].max())
+    if peor <= d:
+        return ("manos", f"lo tiene en sus manos: ganando {n} clasifica directo, sin depender de nadie")
+    mejor = int(pos[mask].min())
+    if MEJORES_TERCEROS() > 0 and mejor <= 3:
+        return ("ayuda", f"aun ganando {n} puede no entrar directo; quedaría como posible mejor 3º (depende de otros grupos)")
+    return ("ayuda", f"aun ganando {n} necesita que se den otros resultados")
+
+def en_sus_manos_texto(eqs, jug, esc, pend):
+    icon = {"manos": "🟢", "ayuda": "🟡", "ya": "✅", "out": "🔴"}
+    lineas = ["**¿Quién depende de sí mismo?**"]
+    for _, r in tabla(eqs, jug).iterrows():
+        e = r["Equipo"]; cat, msg = en_sus_manos(e, esc, pend)
+        lineas.append(f"{icon.get(cat, '•')} **{e}** — {msg}")
+    return "\n\n".join(lineas)
+
+def si_terminara_hoy_texto(eqs, jug, pend=None):
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    lineas = ["**Si la fase terminara hoy (con la tabla actual):**"]
+    for _, r in tabla(eqs, jug).iterrows():
+        p = int(r["Pos"])
+        if p <= d: est = "✅ clasifica directo"
+        elif p == 3 and hay3: est = "🔵 3º — pelearía un lugar entre los mejores terceros"
+        else: est = "🔴 quedaría afuera"
+        lineas.append(f"{p}º **{r['Equipo']}** · {int(r['PTS'])} pts (DG {int(r['DG']):+d}) — {est}")
+    if pend:
+        lineas.append(f"_Todavía falta(n) {len(pend)} partido(s); esto puede cambiar._")
+    return "\n\n".join(lineas)
+
+_ZCOL = {"campeon": "#1b5e20", "libertadores": "#1b5e20", "sudamericana": "#00838f",
+         "clasifica": "#1b5e20", "directo": "#1b5e20", "ascenso": "#1b5e20",
+         "repechaje": "#f9a825", "reduccion": "#ef6c00", "promocion": "#ef6c00",
+         "playoff": "#f9a825", "descenso": "#b71c1c", "desciende": "#b71c1c"}
+
+def _zlow(s):
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", str(s)) if unicodedata.category(c) != "Mn").lower()
+
+def _color_zona(nombre):
+    k = _zlow(nombre)
+    for key, c in _ZCOL.items():
+        if key in k:
+            return c
+    return _C_NEU
+
+def parse_zonas(text):
+    z = []
+    for ln in str(text).splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            hasta = int(parts[0])
+        except ValueError:
+            continue
+        nombre = parts[1].strip()
+        z.append((hasta, nombre, _color_zona(nombre)))
+    z.sort(key=lambda x: x[0])
+    return z
+
+def zona_de(pos, zonas):
+    for hasta, nombre, color in zonas:
+        if pos <= hasta:
+            return nombre, color
+    return "—", _C_NEU
+
+def tabla_zonas_texto(eqs, jug, zonas):
+    return tabla_zonas_texto_df(tabla(eqs, jug), zonas)
+
+def tabla_zonas_texto_df(orden, zonas):
+    L = ["**Si terminara hoy (por zonas):**"]; cur = object()
+    for _, r in orden.iterrows():
+        p = int(r["Pos"]); nombre, _ = zona_de(p, zonas)
+        if nombre != cur:
+            L.append(f"\n__{nombre}__"); cur = nombre
+        L.append(f"{p}º **{r['Equipo']}** · {int(r['PTS'])} pts (DG {int(r['DG']):+d})")
+    return "\n\n".join(L)
+
+def spec_zonas(eqs, jug, zonas):
+    return spec_zonas_df(tabla(eqs, jug), zonas)
+
+def spec_zonas_df(orden, zonas):
+    if not zonas:
+        return None
+    rows, cells, seen = [], [], []
+    for _, r in orden.iterrows():
+        p = int(r["Pos"]); nombre, color = zona_de(p, zonas)
+        rows.append(f"{p}º {r['Equipo']}")
+        cells.append([(f"{int(r['PTS'])}", color), (f"{int(r['DG']):+d}", color), (nombre, color)])
+        if nombre not in [s[1] for s in seen]:
+            seen.append((color, nombre))
+    return {"titulo": "Tabla por zonas (hoy)", "col_headers": ["Pts", "DG", "Zona"],
+            "row_headers": rows, "cells": cells, "corner": "", "leyenda": seen,
+            "footer": "Coloreado por zona según la posición actual."}
+
+# ─── MODO LIGA POR TABLA (pegás tabla + «faltan N fechas», sin resultados) ──────
+def parse_tabla_fixture(text):
+    base, pend, gleft = {}, [], None
+    for raw in str(text).splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        low = _zlow(ln)
+        mf = re.search(r"(\d+)\s*(fecha|fechas|jornada|jornadas)", low)
+        if mf and any(w in low for w in ("faltan", "restan", "quedan", "fecha")):
+            gleft = int(mf.group(1)); continue
+        if not re.search(r"\d", ln) and re.search(r"\s+(?:vs?|x|-|–|—)\s+", ln, flags=re.I):
+            p = re.split(r"\s+(?:vs?|x|-|–|—)\s+", ln, flags=re.I)
+            if len(p) == 2:
+                pend.append((p[0].strip(), p[1].strip())); continue
+        ln2 = re.sub(r"^\s*\d+[\.\)]?\s+(?=\D)", "", ln)  # saca posición inicial
+        if any(sep in ln2 for sep in (",", ";", "\t")):
+            f = [x.strip() for x in re.split(r"[;,\t]", ln2) if x.strip()]
+            name = f[0]; nums = [x for x in f[1:] if re.match(r"^[+-]?\d+$", x)]
+        else:
+            mnum = re.search(r"[+-]?\d", ln2)
+            if not mnum:
+                continue
+            name = ln2[:mnum.start()].strip()
+            nums = re.findall(r"[+-]?\d+", ln2[mnum.start():])
+        if not name or len(nums) < 1:
+            continue
+        pts = int(nums[0]); pj = int(nums[1]) if len(nums) > 1 else 0
+        dg = int(nums[2]) if len(nums) > 2 else 0
+        base[name] = {"pts": pts, "pj": pj, "dg": dg, "gf": max(dg, 0), "ga": max(-dg, 0)}
+    return base, pend, gleft
+
+def liga_restantes(equipos, pend, gleft):
+    if pend:
+        r = {e: 0 for e in equipos}
+        for l, v in pend:
+            if l in r: r[l] += 1
+            if v in r: r[v] += 1
+        return r
+    return {e: (gleft or 0) for e in equipos}
+
+def liga_tabla_df(base):
+    rows = sorted(base.items(), key=lambda kv: (-kv[1]["pts"], -kv[1].get("dg", 0), -kv[1].get("gf", 0)))
+    return pd.DataFrame([{"Pos": i, "Equipo": e, "PJ": d.get("pj", 0), "PTS": d["pts"], "DG": d.get("dg", 0)}
+                         for i, (e, d) in enumerate(rows, 1)])
+
+def liga_maxmin_df(base, rest):
+    rows = [{"Equipo": e, "PJ": d.get("pj", 0), "PTS": d["pts"], "Restan": rest.get(e, 0),
+             "PTS máx": d["pts"] + 3 * rest.get(e, 0)} for e, d in base.items()]
+    return pd.DataFrame(rows).sort_values(["PTS", "PTS máx"], ascending=False).reset_index(drop=True)
+
+def liga_aseg_df(base, rest, n):
+    pts = {e: base[e]["pts"] for e in base}; pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
+    rows = []
+    for e in base:
+        arriba = sum(1 for x in base if x != e and pmax[x] > pts[e])
+        inalc = sum(1 for x in base if x != e and pts[x] > pmax[e])
+        estado = "🟢 asegurado" if arriba < n else ("🔴 sin chances" if inalc >= n else "🟡 depende")
+        rows.append({"Equipo": e, "PTS": pts[e], "PTS máx": pmax[e], f"Top {n}": estado})
+    return pd.DataFrame(rows).sort_values("PTS", ascending=False).reset_index(drop=True)
+
+def zona_target(zonas, texto):
+    """Devuelve (k_puesto, nombre) para «entrar a X» o «no descender»."""
+    if not zonas:
+        return None
+    t = _zlow(texto)
+    if any(w in t for w in ("no desc", "no baj", "salv", "permanec", "mantener la categoria", "no se va")):
+        rele = [i for i, (h, n, c) in enumerate(zonas) if c == "#b71c1c"]
+        if rele:
+            idx = rele[0]
+            k = zonas[idx - 1][0] if idx > 0 else zonas[idx][0] - 1
+            return max(1, k), "no descender"
+    for h, n, c in zonas:
+        if _zlow(n) and _zlow(n) in t:
+            return h, n
+    return None
+
+def _liga_in_out(equipo, base, rest, k):
+    pts = {e: base[e]["pts"] for e in base}; pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
+    arriba = sum(1 for x in base if x != equipo and pmax[x] > pts[equipo])
+    inalc = sum(1 for x in base if x != equipo and pts[x] > pmax[equipo])
+    if arriba < k: return "in"
+    if inalc >= k: return "out"
+    return "pelea"
+
+def liga_duelos_texto(base, rest, pend, zonas):
+    if not pend:
+        return ("Para los cruces entre rivales directos necesito el **fixture** (los partidos que faltan), no solo «faltan N fechas». "
+                "Pegalos como «River vs Boca», uno por línea, y te marco los mano a mano por cada zona.")
+    if not zonas:
+        return "Configurá las zonas en «🎨 Zonas con nombre» (panel) y te detecto los cruces entre rivales directos."
+    L = ["**Cruces entre rivales directos** (partidos que faltan entre dos que pelean la misma zona):"]; any_ = False
+    for h, nombre, c in zonas:
+        pelea = {e for e in base if _liga_in_out(e, base, rest, h) == "pelea"}
+        duelos = [(a, b) for (a, b) in pend if a in pelea and b in pelea]
+        if duelos:
+            any_ = True; L.append(f"\n__{nombre}__")
+            for a, b in duelos:
+                L.append(f"• {a} vs {b}")
+    if not any_:
+        return "No encontré cruces directos entre equipos que peleen la misma zona en el fixture cargado."
+    L.append("\n_Estos son los partidos donde un rival le saca puntos directos al otro: valen doble en la pelea._")
+    return "\n\n".join(L)
+
+def _opciones_liga(equipo, base, rest, pend, k, nombre, linea=None):
+    """Caminos además del piso seguro: (1) los rivales que pelean el corte y su máximo
+    posible ('terminar por encima de'); (2) el mano a mano — cuánto baja tu piso si les
+    ganás a los rivales directos. Adaptativo: detalla cuando son pocos cruces, resume
+    cuando son muchos. Riguroso (fuerza tus victorias y recalcula con _linea_garantia)."""
+    if not pend:
+        return []
+    pts = {e: base[e]["pts"] for e in base}
+    pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
+    if linea is None:
+        linea = _linea_garantia(base, rest, pend, equipo, k)
+    F = linea + 1
+    otros = sorted(((x, pmax[x]) for x in base if x != equipo), key=lambda kv: -kv[1])
+    L = []
+    # (1) rivales al borde del corte (los que realmente disputan el puesto)
+    lo = max(0, k - 3); hi = min(len(otros), k + 2)
+    borde = otros[lo:hi]
+    if borde:
+        lst = ", ".join(f"{x} (máx {m})" for x, m in borde)
+        L.append(f"📊 **El corte de {nombre} lo disputan:** {lst}. Para asegurar sin depender tenés que quedar "
+                 f"por encima de suficientes de ellos; con menos que el piso seguro entrás igual si se quedan cortos "
+                 f"(mirá «chances de {equipo}» o «qué le conviene a {equipo}»).")
+    # (2) mano a mano: detalle si son pocos, resumen si son muchos
+    enpelea = {x for x in base if x != equipo and _liga_in_out(x, base, rest, k) == "pelea"}
+    h2h = [(b if a == equipo else a) for (a, b) in pend if equipo in (a, b) and (b if a == equipo else a) in enpelea]
+    if h2h:
+        rest2 = dict(rest)
+        for r in h2h:
+            rest2[r] = max(0, rest2.get(r, 0) - 1)
+        F2 = _linea_garantia(base, rest2, pend, equipo, k) + 1
+        if len(h2h) <= 5 and F2 < F:
+            L.append(f"🔑 **Mano a mano:** si les ganás a {', '.join(h2h)}, tu piso seguro baja de {F} a **{F2}** "
+                     f"(sumás vos y ellos no).")
+        else:
+            L.append(f"🔑 **Mano a mano:** te quedan {len(h2h)} cruces con rivales directos; ganarlos baja tu piso "
+                     f"y los deja sin sumar. Pesa más en las últimas fechas, cuando la tabla se separa.")
+    return L
+
+def liga_que_necesita_texto(equipo, base, rest, zonas, texto, pend=None):
+    pts = {e: base[e]["pts"] for e in base}; pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
+    orden = liga_tabla_df(base); pos = int(orden.set_index("Equipo").loc[equipo, "Pos"])
+    tgt = zona_target(zonas, texto)
+    if not tgt:
+        nombres = ", ".join(n for _, n, _ in zonas) if zonas else "—"
+        return f"¿Para qué zona? Configurá las zonas en el panel y preguntá, por ej., «qué necesita {equipo} para Libertadores». Zonas activas: {nombres}."
+    k, nombre = tgt
+    gx = rest.get(equipo, 0); meta = "no descender" if nombre == "no descender" else f"entrar a {nombre}"
+    arriba = sum(1 for x in base if x != equipo and pmax[x] > pts[equipo])
+    inalc = sum(1 for x in base if x != equipo and pts[x] > pmax[equipo])
+    otros = sorted((pmax[x] for x in base if x != equipo), reverse=True)
+    L = [f"**¿Qué necesita {equipo} para {meta}?**",
+         f"Está {pos}º con **{pts[equipo]} pts** y le quedan {gx} partidos ({3*gx} en juego)."]
+    if arriba < k:
+        L.append(f"✅ Ya está adentro de **{nombre}** pase lo que pase.")
+    elif inalc >= k:
+        L.append(f"❌ Ya no puede entrar a **{nombre}** (matemáticamente quedó afuera).")
+    else:
+        # Piso AJUSTADO por los mano a mano si tenemos el fixture; si no, piso "todos ganan todo".
+        if pend:
+            linea = _linea_garantia(base, rest, pend, equipo, k)
+            necesita = max(0, (linea + 1) - pts[equipo]) if linea >= 0 else 0
+        else:
+            necesita = max(0, (otros[k-1] + 1) - pts[equipo]) if len(otros) >= k else 0
+        if necesita == 0:
+            L.append(f"✅ Ya está asegurado en **{nombre}**.")
+        elif necesita <= 3 * gx:
+            gan = -(-necesita // 3)
+            L.append(f"Necesita sumar **{necesita} pts** más (de {3*gx} en juego) para asegurarse — le alcanza con ganar {gan} de los {gx}.")
+        else:
+            L.append(f"No le alcanza por sí solo: necesitaría {necesita} pts y solo hay {3*gx} en juego → "
+                     f"tiene que ganar lo suyo **y** que los rivales pinchen.")
+        if pend and necesita > 0:
+            L.extend(_opciones_liga(equipo, base, rest, pend, k, nombre, linea))
+    if pend:
+        mios = [(a, b) for (a, b) in pend if equipo in (a, b)]
+        if mios:
+            rivs = [b if a == equipo else a for (a, b) in mios]
+            L.append("Le queda(n) por jugar: " + ", ".join(rivs) + ".")
+            directos = [r for r in rivs if r in base and _liga_in_out(r, base, rest, k) == "pelea"]
+            if directos:
+                L.append(f"⚔️ **Mano a mano:** se cruza con {', '.join(directos)}, rival(es) directo(s) por {nombre} — "
+                         f"ganarles vale doble (suma y los deja sin sumar).")
+    pq = _porque_liga(equipo, base, rest, zonas, texto, pend)
+    if pq:
+        L.append("🔍 **Por qué:** " + pq)
+    if pend:
+        L.append("_El «ya está / quedó afuera» es exacto. Los puntos a sumar son un **piso ajustado**: es una cota segura "
+                 "(si la alcanzás, entrás fijo) que ya descuenta los mano a mano entre rivales, así no pide imposibles._")
+    else:
+        L.append("_Cuenta por puntos asumiendo que los rivales ganan todo lo suyo (piso seguro). Pegá el **fixture** para ver tus cruces directos._")
+    return "\n\n".join(L)
+
+def _porque_liga(equipo, base, rest, zonas, texto, pend=None):
+    tgt = zona_target(zonas, texto)
+    if not tgt or equipo not in base:
+        return None
+    k, nombre = tgt
+    pts = {e: base[e]["pts"] for e in base}; pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
+    arriba = sum(1 for x in base if x != equipo and pmax[x] > pts[equipo])
+    inalc = sum(1 for x in base if x != equipo and pts[x] > pmax[equipo])
+    g = rest.get(equipo, 0)
+    if arriba < k:
+        pueden = sorted([x for x in base if x != equipo and pmax[x] > pts[equipo]], key=lambda x: -pmax[x])
+        cuales = f"solo {', '.join(pueden)} pueden terminar por encima" if pueden else "nadie puede terminar por encima"
+        return (f"aunque {equipo} pierda todo lo que le queda (se queda en {pts[equipo]}), {cuales}; como entran {k}, ya está adentro.")
+    if inalc >= k:
+        arr = sorted([x for x in base if x != equipo and pts[x] > pmax[equipo]], key=lambda x: -pts[x])
+        muestra = ", ".join(arr[:4]) + (f" y {len(arr)-4} más" if len(arr) > 4 else "")
+        return (f"su techo es {pmax[equipo]} pts (ganando sus {g}), y ya hay {inalc} por encima de ese techo "
+                f"({muestra}): no los puede pasar.")
+    mx = pmax[equipo]
+    if pend:
+        # Explicación coherente con el PISO AJUSTADO por los mano a mano.
+        linea = _linea_garantia(base, rest, pend, equipo, k)
+        falta = max(0, (linea + 1) - pts[equipo])
+        otros = sorted(((x, pmax[x]) for x in base if x != equipo), key=lambda kv: -kv[1])
+        rt, rm = otros[k-1]
+        topk = [x for x, _ in otros[:k]]
+        topset = set(topk)
+        n_cru = sum(1 for (a, b) in pend if a in topset and b in topset)
+        if n_cru > 0 and linea < rm:
+            txt = (f"si los {k} de arriba ({', '.join(topk)}) ganaran TODO, el {k}º llegaría a {rm}; pero "
+                   f"entre ellos les quedan {n_cru} partido{'s' if n_cru != 1 else ''} por jugar, y en cada uno "
+                   f"esos puntos no pueden ir a los dos a la vez, así que en el mejor caso realizable el {k}º "
+                   f"no pasa de {linea}. Para asegurarte tenés que superarlo ({linea+1}) y hoy tenés "
+                   f"{pts[equipo]} → te faltan {falta}.")
+        else:
+            txt = (f"el {k}º que más puede sumar termina como mucho en {linea}; para asegurarte tenés que "
+                   f"superarlo ({linea+1}) y hoy tenés {pts[equipo]} → te faltan {falta}.")
+            if n_cru > 0:
+                txt += (f" (Hay {n_cru} cruce{'s' if n_cru != 1 else ''} entre los de arriba, pero no bajan la línea: "
+                        f"aun perdiéndolos, igual {k} pueden llegar a {linea} porque a alguno le alcanza con ganar el resto.)")
+        if mx <= linea:
+            txt += (f" Y aun ganando todo lo tuyo llegás a {mx}, que no supera esa línea: por eso no te alcanza "
+                    f"solo, necesitás que los de arriba también pinchen.")
+        return txt
+    otros = sorted(((x, pmax[x]) for x in base if x != equipo), key=lambda kv: -kv[1])
+    rt, rm = otros[k-1]
+    falta = max(0, rm + 1 - pts[equipo])
+    txt = (f"el {k}º que más puede sumar es {rt} (termina como mucho en {rm}); para asegurarte tenés que "
+           f"superarlo ({rm+1}) y hoy tenés {pts[equipo]} → te faltan {falta}.")
+    if mx <= rm:
+        txt += (f" Y aun ganando todo lo tuyo llegás a {mx}, que no le gana a {rt}: por eso no te alcanza solo, "
+                f"necesitás que {rt}" + (" y compañía" if k > 1 else "") + " pinche(n).")
+    return txt
+
+def _porque_numero_magico(equipo, eqs, jug, pen, n):
+    ov = _stats(eqs, jug); rest = _restantes(eqs, pen)
+    pts = {e: ov[e]["pts"] for e in eqs}; pmax = {e: pts[e] + 3 * rest[e] for e in eqs}
+    arriba = sum(1 for x in eqs if x != equipo and pmax[x] > pts[equipo])
+    if arriba < n:
+        return f"aunque {equipo} no sume más, solo {arriba} pueden quedar por encima y entran {n}."
+    otros = sorted(((x, pmax[x]) for x in eqs if x != equipo), key=lambda kv: -kv[1])
+    rt, rm = otros[n-1]
+    return (f"el {n}º que más puede llegar es {rt} (tope {rm}); para asegurarte tenés que pasarlo ({rm+1}) "
+            f"y hoy tenés {pts[equipo]} → te faltan {max(0, rm+1-pts[equipo])}.")
+
+def _porque_chances(equipo, esc):
+    d = DIRECTO(); T = len(esc); pos = esc[f"Pos {equipo}"]; n = int((pos <= d).sum())
+    return (f"de los {T} escenarios posibles (todas las formas en que pueden salir los goles de los partidos que faltan), "
+            f"en {n} {equipo} queda entre los {d} primeros y en {T-n} no. Es un conteo de escenarios, no una probabilidad.")
+
+def _porque_bisagra(eqs, jug, pen, esc):
+    sc = bisagra_scores(eqs, jug, pen, esc)
+    if not sc:
+        return None
+    a, b = sc[0]["match"]
+    return (f"según cómo termine {a} vs {b} cambia más que en cualquier otro partido la cantidad de equipos "
+            f"que clasifican; por eso es el que más define.")
+
+def relato_equipo_texto(equipo, eqs, jug, esc, pend):
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    pos = posiciones(eqs, jug)[equipo]
+    row = tabla(eqs, jug).set_index("Equipo").loc[equipo]
+    partes = [f"{equipo} marcha {pos}º del grupo con {int(row.PTS)} puntos (diferencia de gol {int(row.DG):+d})."]
+    own = _pd_de(equipo, pend)
+    if own:
+        rivales = [(v if l == equipo else l) for i, l, v in own]
+        partes.append(f"Le queda{'n' if len(rivales) > 1 else ''} por jugar contra {', '.join(rivales)}.")
+    cat, manos = en_sus_manos(equipo, esc, pend)
+    partes.append(manos[0].upper() + manos[1:] + ".")
+    pmin, pmax = int(esc[f"Pos {equipo}"].min()), int(esc[f"Pos {equipo}"].max())
+    if pmin != pmax:
+        partes.append(f"En el mejor de los casos puede terminar {pmin}º y en el peor, {pmax}º.")
+    if not situacion(equipo, esc)["ya_1"] and situacion(equipo, esc)["puede_1"] and pmin == 1:
+        partes.append("Todavía tiene chances de quedarse con el primer puesto del grupo.")
+    if cat not in ("ya", "out") and own:
+        df = esc.copy(); df["_pos"] = esc[f"Pos {equipo}"].values
+        df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+        frases = []
+        for prop, g in sorted(df.groupby("_p"), key=lambda kv: kv[1]["_pos"].mean()):
+            pmin, pmax = int(g["_pos"].min()), int(g["_pos"].max())
+            if pmax <= d:               res = "se mete entre los que clasifican directo, sin depender de nadie"
+            elif pmin <= d:             res = "puede entrar directo, aunque depende del otro resultado y de la diferencia de gol"
+            elif hay3 and pmax <= 3:    res = "termina tercero y queda a la espera de ser uno de los mejores terceros del torneo"
+            elif hay3 and pmin <= 3:    res = "puede salvarse como tercero o quedar afuera, según los otros grupos"
+            else:                       res = "queda eliminado"
+            frases.append(f"si {prop}, {res}")
+        partes.append("De cara al cierre: " + "; ".join(frases) + ".")
+    return " ".join(partes)
+
+def relato_grupo_texto(eqs, jug, esc, pend):
+    t = tabla(eqs, jug)
+    lider = t.iloc[0]
+    partes = [f"{lider.Equipo} encabeza el grupo con {int(lider.PTS)} puntos."]
+    clasif, elim, vivos = [], [], []
+    for e in eqs:
+        s = situacion(e, esc)
+        (clasif if s["ya_directo"] else elim if s["eliminado"] else vivos).append(e)
+    if clasif: partes.append(("Ya tiene el pasaje asegurado " if len(clasif) == 1 else "Ya tienen el pasaje asegurado ") + ", ".join(clasif) + ".")
+    if elim:   partes.append(("Quedó sin chances " if len(elim) == 1 else "Quedaron sin chances ") + ", ".join(elim) + ".")
+    if vivos:  partes.append(("Sigue con vida " if len(vivos) == 1 else "Siguen con vida ") + ", ".join(vivos) + ".")
+    manos = [e for e in eqs if en_sus_manos(e, esc, pend)[0] == "manos"]
+    if manos:  partes.append(("Depende de sí mismo " if len(manos) == 1 else "Dependen de sí mismos ") + ", ".join(manos) + ".")
+    if pend:   partes.append("Todo se define en: " + ", ".join(f"{l} vs {v}" for l, v in pend) + ".")
+    if pend:
+        try:
+            sc = bisagra_scores(eqs, jug, pend, esc)
+            if sc and sc[0]["swing"] > 0:
+                partes.append(f"El partido que más define la clasificación es {sc[0]['match'][0]} vs {sc[0]['match'][1]}.")
+        except Exception:
+            pass
+    if len(t) >= 3:
+        margen = int(t.iloc[0]["PTS"]) - int(t.iloc[2]["PTS"])
+        partes.append(f"Hoy {t.iloc[0].Equipo} le saca {margen} punto{'s' if margen != 1 else ''} al 3º ({t.iloc[2].Equipo}).")
+    return " ".join(partes)
+
+def _celda_estado(g2, d, hay3):
+    pmin, pmax = int(g2["_pos"].min()), int(g2["_pos"].max())
+    rng = f"{pmin}º" if pmin == pmax else f"{pmin}º-{pmax}º"
+    if pmax <= d:            return ("#1b5e20", f"{rng} ✓")
+    if pmin <= d:            return ("#ef6c00", "DG")
+    if hay3 and pmax <= 3:   return ("#f9a825", "3º*")
+    if hay3 and pmin <= 3:   return ("#ef6c00", "3º/✗")
+    return ("#b71c1c", "✗")
+
+def matriz_necesita_html(equipo, esc, pend):
+    s = spec_necesita(equipo, esc, pend)
+    return _html_tabla(s) if s else None
+
+_C_DIR, _C_DG, _C_3, _C_OUT, _C_GREY, _C_HEAD, _C_NEU = "#1b5e20", "#ef6c00", "#f9a825", "#b71c1c", "#9e9e9e", "#f4f6ef", "#eef1e8"
+
+def _is_dark(c):
+    c = c.lstrip("#")
+    if len(c) != 6: return False
+    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 150
+
+def _verde(pct):
+    t = max(0, min(1, pct / 100))
+    r = int(255 + (27 - 255) * t); g = int(255 + (94 - 255) * t); b = int(255 + (32 - 255) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def _html_tabla(spec):
+    th = "padding:8px 10px;font:600 13px Barlow,sans-serif;color:#1a1a2e;border:1px solid #e0e0e0;background:#f4f6ef;text-align:center"
+    ch, rh, cells = spec["col_headers"], spec["row_headers"], spec["cells"]
+    h = [f'<div style="font:700 17px Barlow,sans-serif;color:#1a1a2e;margin:8px 0 4px">{spec["titulo"]}</div>'] if spec.get("titulo") else []
+    h.append('<div style="overflow-x:auto"><table style="border-collapse:collapse;margin:6px 0">')
+    h.append(f'<tr><th style="{th};text-align:left">{spec.get("corner","")}</th>' + "".join(f'<th style="{th}">{c}</th>' for c in ch) + "</tr>")
+    for i, rl in enumerate(rh):
+        h.append(f'<tr><th style="{th};text-align:left">{rl}</th>')
+        for j in range(len(ch)):
+            text, color = cells[i][j]
+            tcol = "#fff" if _is_dark(color) else "#1a1a2e"
+            h.append(f'<td style="padding:12px 10px;border:1px solid #fff;text-align:center;background:{color};color:{tcol};font:700 15px Barlow,sans-serif">{text}</td>')
+        h.append("</tr>")
+    h.append("</table></div>")
+    if spec.get("leyenda"):
+        chip = "color:#fff;padding:1px 7px;border-radius:3px;font:600 12px Barlow,sans-serif"
+        h.append('<div style="margin-top:6px;line-height:2">' + " &nbsp; ".join(f'<span style="background:{c};{chip}">{l}</span>' for c, l in spec["leyenda"]) + "</div>")
+    if spec.get("footer"):
+        h.append(f'<div style="font:italic 12px Barlow,sans-serif;color:#666;margin-top:4px">{spec["footer"]}</div>')
+    return "".join(h)
+
+def _png_tabla(spec):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from io import BytesIO
+    import textwrap
+    ch, rh, cells = spec["col_headers"], spec["row_headers"], spec["cells"]
+    nC, nR = len(ch), len(rh)
+    cw, rhw, rht, headh, titleh = 2.6, 2.6, 0.78, 0.74, 0.6
+    legh = 0.5 if spec.get("leyenda") else 0.0
+    footh = 0.4 if spec.get("footer") else 0.0
+    W, H = rhw + cw * nC, titleh + headh + rht * nR + legh + footh
+    fig, ax = plt.subplots(figsize=(W, H), dpi=200)
+    ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off"); ax.invert_yaxis()
+    if spec.get("titulo"):
+        ax.text(0.05, titleh * 0.55, spec["titulo"], fontsize=15, fontweight="bold", color="#1a1a2e", va="center")
+    y = titleh
+    ax.add_patch(Rectangle((0, y), rhw, headh, facecolor=_C_HEAD, edgecolor="#e0e0e0"))
+    ax.text(0.12, y + headh / 2, spec.get("corner", ""), fontsize=9, fontweight="bold", color="#1a1a2e", va="center")
+    for j, hd in enumerate(ch):
+        x = rhw + cw * j
+        ax.add_patch(Rectangle((x, y), cw, headh, facecolor=_C_HEAD, edgecolor="#e0e0e0"))
+        ax.text(x + cw / 2, y + headh / 2, "\n".join(textwrap.wrap(str(hd), 18)), fontsize=9, fontweight="bold", color="#1a1a2e", ha="center", va="center")
+    y += headh
+    for i, rl in enumerate(rh):
+        ax.add_patch(Rectangle((0, y), rhw, rht, facecolor=_C_HEAD, edgecolor="#e0e0e0"))
+        ax.text(0.12, y + rht / 2, "\n".join(textwrap.wrap(str(rl), 22)), fontsize=9, fontweight="bold", color="#1a1a2e", va="center")
+        for j in range(nC):
+            text, color = cells[i][j]
+            x = rhw + cw * j
+            ax.add_patch(Rectangle((x, y), cw, rht, facecolor=color, edgecolor="#ffffff", linewidth=2))
+            ax.text(x + cw / 2, y + rht / 2, "\n".join(textwrap.wrap(str(text), 17)), fontsize=11.5, fontweight="bold",
+                    color="#fff" if _is_dark(color) else "#1a1a2e", ha="center", va="center")
+        y += rht
+    if spec.get("leyenda"):
+        lx = 0.05
+        for color, label in spec["leyenda"]:
+            ax.add_patch(Rectangle((lx, y + 0.12), 0.34, 0.26, facecolor=color, edgecolor="none"))
+            ax.text(lx + 0.44, y + 0.25, label, fontsize=8.5, color="#444", va="center")
+            lx += 0.6 + 0.085 * len(label)
+        y += legh
+    if spec.get("footer"):
+        ax.text(0.05, y + 0.2, spec["footer"], fontsize=8, style="italic", color="#666", va="center")
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.18)
+    plt.close(fig)
+    return buf.getvalue()
+
+def spec_necesita(equipo, esc, pend):
+    if len(_pd_de(equipo, pend)) != 1:
+        return None
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    df = esc.copy(); df["_pos"] = esc[f"Pos {equipo}"].values
+    df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+    df["_o"] = df.apply(lambda r: _res_otros(r, equipo, pend), axis=1)
+    filas = [k for k, _ in sorted(df.groupby("_p"), key=lambda kv: kv[1]["_pos"].mean())]
+    cols = [k for k, _ in sorted(df.groupby("_o"), key=lambda kv: kv[1]["_pos"].mean())]
+    cells = []
+    for fp in filas:
+        row = []
+        for c in cols:
+            g2 = df[(df["_p"] == fp) & (df["_o"] == c)]
+            if len(g2) == 0:
+                row.append(("—", "#e0e0e0")); continue
+            color, label = _celda_estado(g2, d, hay3)
+            row.append((label, color))
+        cells.append(row)
+    leyenda = [(_C_DIR, "clasifica directo"), (_C_DG, "según dif. de gol"), (_C_3, "3º (depende)"), (_C_OUT, "afuera")]
+    return {"titulo": f"Qué necesita {equipo}", "col_headers": cols, "row_headers": filas, "cells": cells,
+            "corner": f"{equipo} ⬇ / otros ➡", "leyenda": leyenda,
+            "footer": f"Filas = resultado de {equipo}; columnas = el otro partido del grupo."}
+
+def spec_puesto(equipo, esc, pend, puesto):
+    if len(_pd_de(equipo, pend)) != 1:
+        return None
+    df = esc.copy(); df["_pos"] = esc[f"Pos {equipo}"].values
+    df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+    df["_o"] = df.apply(lambda r: _res_otros(r, equipo, pend), axis=1)
+    filas = [k for k, _ in sorted(df.groupby("_p"), key=lambda kv: kv[1]["_pos"].mean())]
+    cols = [k for k, _ in sorted(df.groupby("_o"), key=lambda kv: kv[1]["_pos"].mean())]
+    cells = []
+    for fp in filas:
+        row = []
+        for c in cols:
+            g2 = df[(df["_p"] == fp) & (df["_o"] == c)]
+            S = set(int(x) for x in g2["_pos"].unique())
+            if S == {puesto}:     row.append((f"{puesto}º ✓", _C_DIR))
+            elif puesto in S:     row.append(("a veces", _C_DG))
+            else:                 row.append(("—", _C_GREY))
+        cells.append(row)
+    leyenda = [(_C_DIR, f"termina {puesto}º"), (_C_DG, f"puede ({puesto}º o no)"), (_C_GREY, "no")]
+    return {"titulo": f"¿Cuándo {equipo} termina {puesto}º?", "col_headers": cols, "row_headers": filas, "cells": cells,
+            "corner": f"{equipo} ⬇ / otros ➡", "leyenda": leyenda,
+            "footer": f"Verde = {equipo} queda {puesto}º seguro; ámbar = depende; gris = no llega."}
+
+def spec_mapa(eqs, esc):
+    T = len(esc); n = len(eqs)
+    order = sorted(eqs, key=lambda e: esc[f"Pos {e}"].mean())
+    cols = [f"{k}º" for k in range(1, n + 1)]
+    cells = []
+    for e in order:
+        pos = esc[f"Pos {e}"]; row = []
+        for k in range(1, n + 1):
+            pct = round(100 * (pos == k).sum() / T)
+            row.append((f"{pct}%" if pct else "·", _verde(pct)))
+        cells.append(row)
+    return {"titulo": "Mapa del grupo · dónde termina cada uno", "col_headers": cols, "row_headers": order, "cells": cells,
+            "corner": "equipo ⬇ / puesto ➡", "leyenda": None,
+            "footer": "% de escenarios en que cae en cada puesto (conteo de marcadores, no probabilidad real)."}
+
+def spec_comparar(e1, e2, eqs, jug, esc, pend):
+    t = tabla(eqs, jug).set_index("Equipo"); pos = posiciones(eqs, jug); rest = _restantes(eqs, pend)
+    pmax = lambda e: int(t.loc[e].PTS) + 3 * rest[e]
+    s1 = round(100 * (esc[f"Pos {e1}"] < esc[f"Pos {e2}"]).sum() / len(esc))
+    s2 = round(100 * (esc[f"Pos {e2}"] < esc[f"Pos {e1}"]).sum() / len(esc))
+    N = _C_NEU
+    rows = [("Posición actual", [(f"{pos[e1]}º", N), (f"{pos[e2]}º", N)]),
+            ("Puntos", [(str(int(t.loc[e1].PTS)), N), (str(int(t.loc[e2].PTS)), N)]),
+            ("Dif. de gol", [(f"{int(t.loc[e1].DG):+d}", N), (f"{int(t.loc[e2].DG):+d}", N)]),
+            ("Máx. posible", [(str(pmax(e1)), N), (str(pmax(e2)), N)]),
+            ("Termina arriba", [(f"{s1}%", _C_DIR if s1 >= s2 else _C_OUT), (f"{s2}%", _C_DIR if s2 > s1 else _C_OUT)])]
+    return {"titulo": f"{e1} vs {e2}", "col_headers": [e1, e2], "row_headers": [r[0] for r in rows],
+            "cells": [r[1] for r in rows], "corner": "", "leyenda": None,
+            "footer": "«Termina arriba» = en qué % de escenarios cada uno queda por encima del otro."}
+
+def bisagra_scores(eqs, jug, pen, esc):
+    d = DIRECTO(); pos = {e: esc[f"Pos {e}"] for e in eqs}
+    res = []
+    for i, (L, V) in enumerate(pen, 1):
+        gl, gv = esc[f"P{i}_gl"], esc[f"P{i}_gv"]
+        masks = {"gana " + L: gl > gv, "empate": gl == gv, "gana " + V: gl < gv}
+        swing = 0.0; afectados = []
+        for t in eqs:
+            ps = []
+            for m in masks.values():
+                sub = pos[t][m]
+                ps.append(100 * (sub <= d).mean() if len(sub) else 0)
+            rng = max(ps) - min(ps); swing += rng
+            if rng >= 60:
+                afectados.append(t)
+        res.append({"match": (L, V), "i": i, "swing": swing, "teams": afectados})
+    res.sort(key=lambda x: -x["swing"])
+    return res
+
+def partido_bisagra_texto(eqs, jug, pen, esc):
+    sc = bisagra_scores(eqs, jug, pen, esc)
+    if not sc:
+        return "No quedan partidos por jugar en el grupo."
+    L = ["**Partidos que más definen** (de mayor a menor peso):"]
+    for k, s in enumerate(sc):
+        a, b = s["match"]; tag = "🔑 " if k == 0 else "• "
+        det = (" — decisivo para " + ", ".join(s["teams"])) if s["teams"] else ""
+        L.append(f"{tag}**{a} vs {b}**{det}")
+    return "\n\n".join(L)
+
+def placa_bisagra_png(eqs, jug, pen, esc):
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from io import BytesIO
+    sc = bisagra_scores(eqs, jug, pen, esc)
+    if not sc:
+        return None
+    labels = [f"{s['match'][0]} vs {s['match'][1]}" for s in sc]
+    vals = [s["swing"] for s in sc]
+    cols = ["#1b5e20"] + ["#7aa53d"] * (len(sc) - 1)
+    fig, ax = plt.subplots(figsize=(6.8, 0.7 * len(sc) + 1.3), dpi=200)
+    ax.barh(range(len(sc)), vals, color=cols, edgecolor="white")
+    ax.set_yticks(range(len(sc))); ax.set_yticklabels(labels, fontsize=11.5, fontweight="bold")
+    ax.invert_yaxis()
+    ax.set_title("Partidos que más definen el grupo", fontsize=14, fontweight="bold", color="#1a1a2e", loc="left")
+    for sp in ["top", "right", "bottom"]:
+        ax.spines[sp].set_visible(False)
+    ax.get_xaxis().set_visible(False)
+    if vals:
+        ax.text(vals[0] * 0.5, 0, "★ BISAGRA", va="center", ha="center", fontsize=11, color="white", fontweight="bold")
+    fig.text(0.01, -0.02, "Mayor barra = el resultado cambia más quién clasifica.", fontsize=8, style="italic", color="#666")
+    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.2); plt.close(fig)
+    return buf.getvalue()
+
+def barras_puesto_png(equipo, esc):
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from io import BytesIO
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    teams = [c[4:] for c in esc.columns if c.startswith("Pos ")]
+    n = len(teams); T = len(esc); pos = esc[f"Pos {equipo}"]
+    pcts = [100 * (pos == k).sum() / T for k in range(1, n + 1)]
+    cols = ["#1b5e20" if k <= d else ("#f9a825" if (k == 3 and hay3) else "#b71c1c") for k in range(1, n + 1)]
+    fig, ax = plt.subplots(figsize=(6.4, 3.5), dpi=200)
+    bars = ax.bar([f"{k}º" for k in range(1, n + 1)], pcts, color=cols, edgecolor="white")
+    for b, p in zip(bars, pcts):
+        ax.text(b.get_x() + b.get_width() / 2, p + 1, f"{p:.0f}%", ha="center", va="bottom", fontsize=11.5, fontweight="bold", color="#1a1a2e")
+    ax.set_ylim(0, max(pcts) * 1.2 + 4)
+    ax.set_title(f"Dónde puede terminar {equipo}", fontsize=14, fontweight="bold", color="#1a1a2e", loc="left")
+    for sp in ["top", "right", "left"]:
+        ax.spines[sp].set_visible(False)
+    ax.get_yaxis().set_visible(False); ax.tick_params(axis="x", labelsize=12)
+    fig.text(0.01, -0.03, "% de escenarios (conteo de marcadores, no probabilidad real). Verde = clasifica.", fontsize=8, style="italic", color="#666")
+    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.2); plt.close(fig)
+    return buf.getvalue()
+
+def _chances_label(pct, s):
+    if s.get("ya_directo"): return "YA CLASIFICÓ", "#1b5e20"
+    if s.get("eliminado"): return "ELIMINADO", "#b71c1c"
+    if pct >= 85: return "MUY BIEN", "#1b5e20"
+    if pct >= 60: return "BIEN ENCAMINADO", "#7aa53d"
+    if pct >= 40: return "MANO A MANO", "#f9a825"
+    if pct >= 15: return "COMPLICADO", "#ef6c00"
+    return "CASI SIN CHANCES", "#b71c1c"
+
+def chances_texto(equipo, eqs, jug, esc, pend):
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0; s = situacion(equipo, esc)
+    pos = esc[f"Pos {equipo}"]; pct = 100 * float((pos <= d).mean())
+    if s["ya_directo"]: pct = 100
+    if s["eliminado"]: pct = 0
+    verdict, _ = _chances_label(pct, s)
+    icon = "✅" if s["ya_directo"] else ("🔴" if s["eliminado"] else ("🟢" if pct >= 60 else ("🟡" if pct >= 40 else "🟠")))
+    diez = max(0, min(10, round(pct / 10)))
+    L = [f"**¿Cómo viene {equipo}?**", f"{icon} **{verdict}**"]
+    if s["ya_directo"]:
+        L.append(f"{equipo} ya tiene la clasificación asegurada pase lo que pase.")
+    elif s["eliminado"]:
+        L.append(f"{equipo} ya no puede clasificar: quedó sin chances matemáticas.")
+    else:
+        L.append(f"En **{diez} de cada 10** formas en que pueden salir los partidos que faltan, {equipo} clasifica entre los {d} primeros.")
+        df = esc.copy(); df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1); df["_ok"] = (pos <= d).values
+        rates = {p: g["_ok"].mean() for p, g in df.groupby("_p") if p}
+        gana = [p for p in rates if p.startswith("le gana")]
+        if gana and all(rates[p] >= 0.999 for p in gana):
+            L.append("Lo tiene en sus manos: **ganando** lo suyo queda adentro sin depender de nadie.")
+        else:
+            cat, manos = en_sus_manos(equipo, esc, pend)
+            L.append(manos[0].upper() + manos[1:] + ".")
+        if hay3 and s.get("puede_tercero"):
+            L.append(f"_Aun sin entrar entre los {d} primeros, puede colarse como uno de los mejores terceros._")
+    L.append("_Guía didáctica: cuenta de cuántas formas pueden salir los goles, no es una probabilidad real._")
+    return "\n\n".join(L)
+
+def placa_chances_png(equipo, eqs, jug, esc, pend):
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+    from io import BytesIO
+    d = DIRECTO(); s = situacion(equipo, esc); pos = esc[f"Pos {equipo}"]
+    pct = 100 * float((pos <= d).mean())
+    if s["ya_directo"]: pct = 100
+    if s["eliminado"]: pct = 0
+    verdict, _ = _chances_label(pct, s)
+    diez = max(0, min(10, round(pct / 10)))
+    fig, ax = plt.subplots(figsize=(7.2, 2.2), dpi=200)
+    cmap = LinearSegmentedColormap.from_list("c", ["#b71c1c", "#ef6c00", "#f9a825", "#7aa53d", "#1b5e20"])
+    ax.imshow(np.linspace(0, 1, 256).reshape(1, -1), extent=[0, 100, 0, 1], aspect="auto", cmap=cmap)
+    ax.plot([pct], [1.12], marker="v", markersize=18, color="#1a1a2e", clip_on=False)
+    ax.text(pct, 1.45, verdict, ha="center", va="bottom", fontsize=15, fontweight="bold", color="#1a1a2e", clip_on=False)
+    for x, lab in [(10, "Casi nada"), (30, "Difícil"), (50, "Parejo"), (70, "Probable"), (90, "Casi seguro")]:
+        ax.text(x, -0.22, lab, ha="center", va="top", fontsize=9.5, color="#444")
+    ax.set_xlim(0, 100); ax.set_ylim(-1.4, 2.3); ax.axis("off")
+    ax.set_title(f"¿Cómo viene {equipo}?", fontsize=15, fontweight="bold", color="#1a1a2e", loc="left", y=0.92)
+    sub = ("Ya clasificó" if s["ya_directo"] else ("Quedó eliminado" if s["eliminado"]
+           else f"Clasifica en {diez} de cada 10 formas posibles"))
+    ax.text(50, -0.62, sub, ha="center", va="top", fontsize=10.5, style="italic", color="#555")
+    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.3); plt.close(fig)
+    return buf.getvalue()
+
+def aplicar_resultados(eqs, jugados, pend, fixed):
+    """fixed: {indice_1based: 'L'/'E'/'V'}. Triunfos 1-0, empates 0-0. Devuelve (jugados_sim, pendientes_restantes)."""
+    jug = list(jugados); rem = []
+    for i, (l, v) in enumerate(pend, 1):
+        o = fixed.get(i)
+        if o == "L":   jug.append((l, v, 1, 0))
+        elif o == "E": jug.append((l, v, 0, 0))
+        elif o == "V": jug.append((l, v, 0, 1))
+        else:          rem.append((l, v))
+    return jug, rem
+
+def filtrar_esc(esc, fixed):
+    m = pd.Series(True, index=esc.index)
+    for i, o in fixed.items():
+        gl, gv = esc[f"P{i}_gl"], esc[f"P{i}_gv"]
+        if o == "L":   m &= gl > gv
+        elif o == "E": m &= gl == gv
+        elif o == "V": m &= gl < gv
+    return esc[m]
+
+def previa_condicional_texto(eqs, jugados, pend, esc, fixed):
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    desc = []
+    for i, (l, v) in enumerate(pend, 1):
+        o = fixed.get(i)
+        if o == "L":   desc.append(f"{l} le gana a {v}")
+        elif o == "E": desc.append(f"empatan {l} y {v}")
+        elif o == "V": desc.append(f"{v} le gana a {l}")
+    sub = filtrar_esc(esc, fixed)
+    if len(sub) == 0:
+        return "Esa combinación no es posible con los partidos cargados."
+    L = []
+    if desc:
+        L.append("**Si " + ", y ".join(desc) + ":**")
+    clasi, afue, dep = [], [], []
+    for e in eqs:
+        pos = sub[f"Pos {e}"]; r = float((pos <= d).mean())
+        if r >= 0.999:
+            clasi.append(e)
+        elif r <= 0.001:
+            if hay3 and float((pos == 3).mean()) > 0:
+                dep.append(e + " (a pelear el 3er puesto)")
+            else:
+                afue.append(e)
+        else:
+            dep.append(e)
+    if clasi: L.append(f"Clasifican entre los {d}: **{', '.join(clasi)}**.")
+    if dep:   L.append("En duda según el resto: " + ", ".join(dep) + ".")
+    if afue:  L.append("Quedaría(n) afuera: " + ", ".join(afue) + ".")
+    rem = [f"{l} vs {v}" for i, (l, v) in enumerate(pend, 1) if i not in fixed]
+    if rem:
+        L.append("_Falta definir: " + ", ".join(rem) + "._")
+    L.append("_La tabla de arriba asume triunfos 1-0 y empates 0-0 (el DG real depende del marcador). La clasificación considera todos los marcadores posibles de los partidos que fijaste; en empates de puntos muy finos puede definirse por desempate._")
+    return "\n\n".join(L)
+
+def _branch_label(equipo, own, combo):
+    parts = []
+    for i, l, v in own:
+        o = combo[i]; other = v if l == equipo else l
+        if (o == "L" and l == equipo) or (o == "V" and v == equipo):
+            parts.append(f"le gana a {other}")
+        elif o == "E":
+            parts.append(f"empata con {other}")
+        else:
+            parts.append(f"pierde con {other}")
+    return " y ".join(parts)
+
+def arbol_branches(equipo, eqs, jug, esc, pend):
+    import itertools
+    own = _pd_de(equipo, pend)
+    if not own or len(own) > 2:
+        return None
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    res = []
+    for vals in itertools.product(["L", "E", "V"], repeat=len(own)):
+        combo = {i: o for (i, l, v), o in zip(own, vals)}
+        m = pd.Series(True, index=esc.index)
+        for i, o in combo.items():
+            gl, gv = esc[f"P{i}_gl"], esc[f"P{i}_gv"]
+            m &= (gl > gv) if o == "L" else ((gl == gv) if o == "E" else (gl < gv))
+        sub = esc[m]
+        if len(sub) == 0:
+            continue
+        pos = sub[f"Pos {equipo}"]; rd = float((pos <= d).mean()); r3 = float((pos == 3).mean())
+        if rd >= 0.999:
+            verd, col = "Clasifica", "#1b5e20"
+        elif rd <= 0.001:
+            verd, col = ("Pelea 3º", "#f9a825") if (hay3 and r3 > 0) else ("Afuera", "#b71c1c")
+        else:
+            verd, col = "Depende", "#ef6c00"
+        # orden desde la óptica del equipo: gana(0) / empata(1) / pierde(2)
+        pkey = []
+        for i, l, v in own:
+            o = combo[i]
+            pkey.append(0 if ((o == "L" and l == equipo) or (o == "V" and v == equipo)) else (1 if o == "E" else 2))
+        res.append({"label": _branch_label(equipo, own, combo).capitalize(), "verd": verd,
+                    "col": col, "key": tuple(pkey)})
+    res.sort(key=lambda r: r["key"])
+    return res
+
+def placa_arbol_png(equipo, eqs, jug, esc, pend):
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+    import textwrap
+    from io import BytesIO
+    br = arbol_branches(equipo, eqs, jug, esc, pend)
+    if not br:
+        return None
+    n = len(br); fig, ax = plt.subplots(figsize=(7.6, 0.92 * n + 1.1), dpi=200)
+    ax.set_xlim(0, 10); ax.set_ylim(0, n); ax.axis("off")
+    ax.set_title(f"¿Qué pasa con {equipo}?", fontsize=15, fontweight="bold", color="#1a1a2e", loc="left", pad=12)
+    ymid = n / 2
+    ax.add_patch(FancyBboxPatch((0.1, ymid - 0.42), 2.3, 0.84, boxstyle="round,pad=0.03,rounding_size=0.12",
+                                facecolor="#1a1a2e", edgecolor="none"))
+    ax.text(1.25, ymid, equipo, ha="center", va="center", color="white", fontsize=12, fontweight="bold")
+    for j, b in enumerate(br):
+        y = n - 0.5 - j
+        ax.plot([2.4, 3.4], [ymid, y], color="#bbb", lw=2, zorder=0)
+        ax.add_patch(FancyBboxPatch((3.4, y - 0.36), 3.6, 0.72, boxstyle="round,pad=0.03,rounding_size=0.1",
+                                    facecolor="#eef1e8", edgecolor="#d8ddcf"))
+        ax.text(5.2, y, "\n".join(textwrap.wrap(b["label"], 26)), ha="center", va="center", fontsize=10.5,
+                color="#1a1a2e", fontweight="bold")
+        ax.plot([7.0, 7.5], [y, y], color="#bbb", lw=2, zorder=0)
+        ax.add_patch(FancyBboxPatch((7.5, y - 0.36), 2.3, 0.72, boxstyle="round,pad=0.03,rounding_size=0.1",
+                                    facecolor=b["col"], edgecolor="none"))
+        ax.text(8.65, y, b["verd"], ha="center", va="center", color="white", fontsize=11, fontweight="bold")
+    fig.text(0.01, -0.02, "Según el resultado de su partido. «Depende» = puede clasificar o no según los otros partidos.",
+             fontsize=8, style="italic", color="#666")
+    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.25); plt.close(fig)
+    return buf.getvalue()
+
+def _porque_pasar(equipo, eqs, jug, esc, pend, n):
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    s = situacion(equipo, esc, d)
+    ov = _stats(eqs, jug); rest = _restantes(eqs, pend)
+    pts = {e: ov[e]["pts"] for e in eqs}; pmax = {e: pts[e] + 3 * rest[e] for e in eqs}
+    p = pts[equipo]; mx = pmax[equipo]; g = rest[equipo]
+    def lst(ts, lim=4):
+        ts = list(ts); return ", ".join(ts[:lim]) + (f" y {len(ts)-lim} más" if len(ts) > lim else "")
+    # YA CLASIFICADO ENTRE LOS DIRECTOS
+    if s["ya_directo"]:
+        nopas = sorted([x for x in eqs if x != equipo and pmax[x] < p], key=lambda x: -pmax[x])
+        extra = ("; " + "; ".join(f"{x}, aun ganando todo, llega a {pmax[x]}" for x in nopas[:3]) + " — no te alcanzan") if nopas else ""
+        return f"{equipo} ya termina entre los {d} pase lo que pase: tiene {p} pts y los de atrás no lo pueden dejar afuera{extra}."
+    # ELIMINADO DE TODO (ni mejor tercero)
+    if s["eliminado"]:
+        arr = sorted([x for x in eqs if x != equipo and pts[x] > mx], key=lambda x: -pts[x])
+        det = f" Ya hay {len(arr)} por encima de su techo de {mx} ({lst(arr)}), no los puede pasar." if arr else ""
+        cola = " (ni siquiera le da para pelear el mejor tercero)" if hay3 else ""
+        return f"{equipo} quedó afuera{cola}: su techo es {mx} pts (ganando sus {g}) y no alcanza.{det}"
+    # EN JUEGO
+    pueden = sorted([x for x in eqs if x != equipo and pmax[x] >= p], key=lambda x: -pmax[x])
+    partes = []
+    if s["puede_directo"]:
+        if pueden:
+            partes.append(f"{equipo} tiene {p} pts (techo {mx}) y puede entrar entre los {d}, pero todavía lo pueden alcanzar {lst(pueden)}, así que depende de esos partidos")
+        else:
+            partes.append(f"{equipo} puede entrar entre los {d}")
+        igualan = [x for x in eqs if x != equipo and pmax[x] >= mx]
+        if len(igualan) >= n:
+            partes.append(f"aun ganando todo (llega a {mx}) no se asegura, porque {lst(igualan)} también pueden llegar a {mx} o más")
+        if hay3 and s["puede_tercero"]:
+            partes.append(f"si no entra entre los {d}, igual puede colarse como **mejor tercero**, que depende de cómo terminen los otros grupos")
+    else:
+        if hay3 and s["asegura_vivo"]:
+            partes.append(f"{equipo} ya no entra entre los {d}, pero tiene **asegurado el 3er puesto**; que ese 3º clasifique depende de los otros grupos (entran los 8 mejores terceros)")
+        elif hay3 and s["puede_tercero"]:
+            partes.append(f"{equipo} ya no entra entre los {d}; su chance es ser uno de los **mejores terceros**, que depende de cómo terminen los otros grupos")
+        else:
+            partes.append(f"{equipo} la tiene muy cuesta arriba")
+    return ". ".join(x[0].upper() + x[1:] for x in partes) + "."
+
+# ═══ CIENCIA DE DATOS: fuerza estimada, Monte Carlo liga, proyección, importador ═══
+
+# ── Métricas periodísticas: forma, rachas, local/visitante, dificultad de fixture ──
+
+def _res_letra(e, l, v, gl, gv):
+    if gl == gv: return "E"
+    return "G" if (l if gl > gv else v) == e else "P"
+
+def forma_equipo(e, jug, n=5):
+    letras = [_res_letra(e, l, v, gl, gv) for (l, v, gl, gv) in jug if e in (l, v)]
+    ult = letras[-n:]
+    pts = sum(3 if x == "G" else (1 if x == "E" else 0) for x in ult)
+    return ult, pts
+
+def racha_equipo(e, jug):
+    letras = [_res_letra(e, l, v, gl, gv) for (l, v, gl, gv) in jug if e in (l, v)]
+    if not letras:
+        return "sin partidos"
+    last = letras[-1]; k = 0
+    for x in reversed(letras):
+        if x == last: k += 1
+        else: break
+    inv = 0
+    for x in reversed(letras):
+        if x in ("G", "E"): inv += 1
+        else: break
+    sinv = 0
+    for x in reversed(letras):
+        if x in ("P", "E"): sinv += 1
+        else: break
+    if last == "G":
+        return f"{k} victoria{'s' if k>1 else ''} al hilo" + (f" ({inv} invicto)" if inv > k else "")
+    if last == "E":
+        if inv > k: return f"{inv} partidos invicto"
+        if sinv > k: return f"{sinv} sin ganar"
+        return f"{k} empate{'s' if k>1 else ''} seguido{'s' if k>1 else ''}"
+    return f"{k} derrota{'s' if k>1 else ''} al hilo" + (f" ({sinv} sin ganar)" if sinv > k else "")
+
+def tabla_forma_df(eqs, jug, n=5):
+    ov = _stats(eqs, jug)
+    rows = []
+    for e in eqs:
+        ult, p5 = forma_equipo(e, jug, n)
+        rows.append({"Equipo": e, "PTS": ov[e]["pts"], "Últimos 5": "".join(ult) or "—",
+                     "Pts últ. 5": p5, "Racha": racha_equipo(e, jug)})
+    return pd.DataFrame(rows).sort_values(["Pts últ. 5", "PTS"], ascending=False).reset_index(drop=True)
+
+def local_visitante_df(eqs, jug):
+    rows = []
+    for e in eqs:
+        pl = pjl = pv = pjv = 0
+        for (l, v, gl, gv) in jug:
+            if l == e:
+                pjl += 1; pl += 3 if gl > gv else (1 if gl == gv else 0)
+            elif v == e:
+                pjv += 1; pv += 3 if gv > gl else (1 if gl == gv else 0)
+        rows.append({"Equipo": e, "PJ local": pjl, "Pts local": pl,
+                     "Pts/PJ local": round(pl / pjl, 2) if pjl else 0.0,
+                     "PJ visita": pjv, "Pts visita": pv,
+                     "Pts/PJ visita": round(pv / pjv, 2) if pjv else 0.0})
+    return pd.DataFrame(rows).sort_values("Pts/PJ local", ascending=False).reset_index(drop=True)
+
+def dificultad_fixture_df(eqs, pen, ppg, rest=None):
+    med = (sum(ppg.values()) / len(ppg)) if ppg else 0.0
+    rows = []
+    for e in eqs:
+        rivs = [v if l == e else l for (l, v) in pen if e in (l, v)]
+        extra = max(0, (rest or {}).get(e, len(rivs)) - len(rivs)) if rest else 0
+        vals = [ppg.get(r, med) for r in rivs] + [med] * extra
+        idx = round(sum(vals) / len(vals), 2) if vals else np.nan
+        rows.append({"Equipo": e, "Restan": len(rivs) + extra,
+                     "Rivales que quedan": (", ".join(rivs[:6]) + ("…" if len(rivs) > 6 else "")) or "—",
+                     "Dificultad (pts/PJ rival)": idx})
+    return pd.DataFrame(rows).sort_values("Dificultad (pts/PJ rival)", ascending=False,
+                                          na_position="last").reset_index(drop=True)
+
+def ficha_equipo_texto(e, eqs, jug, pen):
+    ov = _stats(eqs, jug); t = tabla(eqs, jug)
+    pos = list(t["Equipo"]).index(e) + 1 if e in list(t["Equipo"]) else "?"
+    d = ov[e]; pj = d["pj"]; ppg = d["pts"] / pj if pj else 0.0
+    ult, p5 = forma_equipo(e, jug)
+    pl = pjl = pv = pjv = 0
+    for (l, v, gl, gv) in jug:
+        if l == e:   pjl += 1; pl += 3 if gl > gv else (1 if gl == gv else 0)
+        elif v == e: pjv += 1; pv += 3 if gv > gl else (1 if gl == gv else 0)
+    rest = _restantes(eqs, pen)
+    rivs = [v if l == e else l for (l, v) in pen if e in (l, v)]
+    ppgs = {x: (ov[x]["pts"] / ov[x]["pj"]) if ov[x]["pj"] else 0.0 for x in eqs}
+    med = (sum(ppgs.values()) / len(ppgs)) if ppgs else 0.0
+    dif = round(sum(ppgs.get(r, med) for r in rivs) / len(rivs), 2) if rivs else None
+    L = [f"**Ficha de {e}**",
+         f"{pos}º con **{d['pts']} pts** en {pj} PJ ({round(ppg,2)} por partido) · GF {d['gf']} / GC {d['ga']} (DG {d['dg']:+d}).",
+         f"**Forma (últ. 5):** {''.join(ult) or '—'} ({p5} pts) · **Racha:** {racha_equipo(e, jug)}.",
+         f"**Local:** {pl} pts en {pjl} PJ ({round(pl/pjl,2) if pjl else 0}/PJ) · **Visitante:** {pv} pts en {pjv} PJ ({round(pv/pjv,2) if pjv else 0}/PJ)."]
+    if rivs:
+        L.append(f"**Le quedan {rest[e]}:** {', '.join(rivs)}" +
+                 (f" · dificultad {dif} pts/PJ ({'más brava que' if dif and dif>med else 'más liviana que'} la media {round(med,2)})." if dif is not None else "."))
+    L.append(f"**Techo:** {d['pts'] + 3*rest[e]} pts ganando todo.")
+    return "\n\n".join(L)
+
+def ficha_liga_texto(e, base, rest, pend, zonas):
+    t = liga_tabla_df(base); pos = int(t.set_index("Equipo").loc[e, "Pos"])
+    d = base[e]; pj = d.get("pj", 0); ppg = d["pts"] / pj if pj else 0.0; r = rest.get(e, 0)
+    z = zona_de(pos, zonas)[0] if zonas else "—"
+    rivs = [v if l == e else l for (l, v) in pend if e in (l, v)]
+    ppgs = {x: (base[x]["pts"] / base[x].get("pj", 1)) if base[x].get("pj") else 0.0 for x in base}
+    med = (sum(ppgs.values()) / len(ppgs)) if ppgs else 0.0
+    L = [f"**Ficha de {e}**",
+         f"{pos}º con **{d['pts']} pts** en {pj} PJ ({round(ppg,2)} por partido) · DG {d.get('dg',0):+d} · Zona hoy: **{z}**.",
+         f"**Le quedan {r} partidos** ({3*r} pts en juego) · **Proyección a este ritmo:** {round(d['pts'] + ppg*r,1)} pts · **Techo:** {d['pts'] + 3*r}."]
+    if rivs:
+        dif = round(sum(ppgs.get(x, med) for x in rivs) / len(rivs), 2)
+        L.append(f"**Rivales que quedan:** {', '.join(rivs)} · dificultad {dif} pts/PJ (media {round(med,2)}).")
+    else:
+        L.append("_Pegá el fixture («A vs B») para ver rivales y dificultad del calendario. Para forma y local/visitante, importá los resultados (JSON del actor) o pegalos._")
+    return "\n\n".join(L)
+
+def fuerza_desde_stats(eqs, jug):
+    """Fuerza por equipo: mezcla rendimiento global (70%) + forma últimos 5 (30%)."""
+    ov = _stats(eqs, jug)
+    ppg = {e: (ov[e]["pts"] / ov[e]["pj"]) if ov[e]["pj"] else 1.0 for e in eqs}
+    ppg5 = {}
+    for e in eqs:
+        ult, p5 = forma_equipo(e, jug, 5)
+        ppg5[e] = (p5 / len(ult)) if ult else ppg[e]
+    mix = {e: 0.7 * ppg[e] + 0.3 * ppg5[e] for e in eqs}
+    med = sum(mix.values()) / len(mix) if mix else 1.0
+    if not med:
+        return None
+    return {e: min(1.7, max(0.55, mix[e] / med)) for e in eqs}
+
+def _fuerza_liga(base):
+    ppg = {e: (d["pts"] / d.get("pj", 0)) if d.get("pj") else 1.0 for e, d in base.items()}
+    med = sum(ppg.values()) / len(ppg) if ppg else 1.0
+    return {e: min(1.8, max(0.4, (ppg[e] / med) if med else 1.0)) for e in base}
+
+def liga_probabilidades_df(base, rest, pend, zonas, n=4000, seed=7, pdraw=0.26, fuerza=None):
+    """Monte Carlo del cierre de la liga: % de terminar en cada zona. Usa el fixture pegado
+    para los cruces reales y rival promedio para los partidos sin rival conocido."""
+    rng = np.random.default_rng(seed)
+    eqs = list(base.keys()); idx = {e: i for i, e in enumerate(eqs)}
+    s = fuerza or _fuerza_liga(base)
+    pts0 = np.array([base[e]["pts"] for e in eqs], float)
+    dg0 = np.array([float(base[e].get("dg", 0)) for e in eqs])
+    pts = np.tile(pts0, (n, 1))
+    fix = [(a, b) for (a, b) in pend if a in idx and b in idx]
+    en_fix = {e: 0 for e in eqs}
+    for a, b in fix:
+        en_fix[a] += 1; en_fix[b] += 1
+        pa = (1 - pdraw) * (s[a] * 1.22) / (s[a] * 1.22 + s[b])  # ventaja de localía
+        u = rng.random(n)
+        ga = u < pa; gb = u >= pa + pdraw
+        pts[:, idx[a]] += np.where(ga, 3, np.where(gb, 0, 1))
+        pts[:, idx[b]] += np.where(gb, 3, np.where(ga, 0, 1))
+    for e in eqs:
+        extra = max(0, rest.get(e, 0) - en_fix[e])
+        if extra:
+            pa = (1 - pdraw) * s[e] / (s[e] + 1.0)
+            u = rng.random((n, extra))
+            pts[:, idx[e]] += np.where(u < pa, 3, np.where(u < pa + pdraw, 1, 0)).sum(axis=1)
+    key = pts + dg0[None, :] * 1e-4 + rng.random((n, len(eqs))) * 1e-7
+    pos = np.argsort(np.argsort(-key, axis=1), axis=1) + 1
+    bandas = []
+    prev = 0
+    for h, nombre, _c in sorted(zonas or [], key=lambda z: z[0]):
+        bandas.append((prev + 1, h, nombre)); prev = h
+    rows = []
+    orden = sorted(eqs, key=lambda e: (-base[e]["pts"], -base[e].get("dg", 0)))
+    for e in orden:
+        p = pos[:, idx[e]]
+        row = {"Equipo": e, "PTS": base[e]["pts"], "1º %": round(100 * float((p == 1).mean()), 1)}
+        for lo, hi, nombre in bandas:
+            row[f"{nombre} %"] = round(100 * float(((p >= lo) & (p <= hi)).mean()), 1)
+        if not bandas:
+            row["Top 3 %"] = round(100 * float((p <= 3).mean()), 1)
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    checks = {}
+    for lo, hi, nombre in bandas:
+        observed = float(((pos >= lo) & (pos <= hi)).mean(axis=0).sum())
+        expected = float(hi - lo + 1)
+        if not np.isclose(observed, expected, atol=1e-10):
+            raise AssertionError(f"Invariante Monte Carlo rota en {nombre}: {observed} != {expected}")
+        checks[nombre] = {"observado": observed, "cupos": expected}
+    out.attrs["mc_invariants"] = checks
+    return out
+
+NOTA_MC_LIGA = ("_Estimación por simulación (4.000 torneos): la fuerza de cada equipo sale de sus puntos por "
+                "partido (ponderando la forma reciente si hay resultados), con los cruces reales del fixture, "
+                "ventaja de localía y rival promedio en lo demás. Es una guía para la nota, no un pronóstico: "
+                "no ve lesiones ni bajas._")
+
+def liga_proyeccion_df(base, rest):
+    rows = []
+    for e, d in base.items():
+        pj = d.get("pj", 0); ppg = (d["pts"] / pj) if pj else 0.0; r = rest.get(e, 0)
+        rows.append({"Equipo": e, "PJ": pj, "PTS": d["pts"], "Pts/partido": round(ppg, 2), "Restan": r,
+                     "Proyección (ritmo)": round(d["pts"] + ppg * r, 1), "Techo": d["pts"] + 3 * r})
+    return pd.DataFrame(rows).sort_values(["Proyección (ritmo)", "PTS"], ascending=False).reset_index(drop=True)
+
+def liga_comparar_df(a, b, base, rest, zonas):
+    t = liga_tabla_df(base).set_index("Equipo")
+    def fila(e):
+        pos = int(t.loc[e, "Pos"]); pj = base[e].get("pj", 0); r = rest.get(e, 0)
+        z = zona_de(pos, zonas)[0] if zonas else "—"
+        return {"Posición": pos, "Puntos": base[e]["pts"], "PJ": pj, "DG": base[e].get("dg", 0),
+                "Pts/partido": round(base[e]["pts"] / pj, 2) if pj else 0.0,
+                "Restan": r, "Techo": base[e]["pts"] + 3 * r, "Zona hoy": z}
+    fa, fb = fila(a), fila(b)
+    return pd.DataFrame([{"Dato": k, a: fa[k], b: fb[k]} for k in fa])
+
+def chances_mc(equipo, eqs, jug, pen, n=6000):
+    """Chances de clasificar sin enumeración: simulación con fuerza estimada. Devuelve (pct, df)."""
+    d = DIRECTO()
+    f = fuerza_desde_stats(eqs, jug)
+    df = probabilidades(eqs, jug, pen, n=n, fuerza=f)
+    col = "1º %" if d == 1 else ("Top 2 %" if d == 2 else "Top 3 %")
+    fila = df[df["Equipo"] == equipo]
+    pct = float(fila[col].iloc[0]) if len(fila) else 0.0
+    return pct, df
+
+def placa_chances_mc_png(equipo, pct, nota="Estimación por simulación"):
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+    from io import BytesIO
+    verdict, _ = _chances_label(pct, {})
+    fig, ax = plt.subplots(figsize=(7.2, 2.2), dpi=200)
+    cmap = LinearSegmentedColormap.from_list("c", ["#b71c1c", "#ef6c00", "#f9a825", "#7aa53d", "#1b5e20"])
+    ax.imshow(np.linspace(0, 1, 256).reshape(1, -1), extent=[0, 100, 0, 1], aspect="auto", cmap=cmap)
+    ax.plot([pct], [1.12], marker="v", markersize=18, color="#1a1a2e", clip_on=False)
+    ax.text(pct, 1.45, verdict, ha="center", va="bottom", fontsize=15, fontweight="bold", color="#1a1a2e", clip_on=False)
+    for x, lab in [(10, "Casi nada"), (30, "Difícil"), (50, "Parejo"), (70, "Probable"), (90, "Casi seguro")]:
+        ax.text(x, -0.22, lab, ha="center", va="top", fontsize=9.5, color="#444")
+    ax.set_xlim(0, 100); ax.set_ylim(-1.4, 2.3); ax.axis("off")
+    ax.set_title(f"¿Cómo viene {equipo}?", fontsize=15, fontweight="bold", color="#1a1a2e", loc="left", y=0.92)
+    ax.text(50, -0.62, nota, ha="center", va="top", fontsize=10.5, style="italic", color="#555")
+    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.3); plt.close(fig)
+    return buf.getvalue()
+
+def partidos_desde_url(url):
+    """Lee la tabla cruzada (matriz equipo × equipo) de una página tipo Wikipedia.
+    Devuelve (jugados, pendientes, error, nota). Las celdas con marcador son resultados;
+    las vacías, partidos por jugar. Detecta si el torneo es ida y vuelta o una sola rueda."""
+    import requests as _rq, io as _io
+    try:
+        html = _rq.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text
+    except Exception as e:
+        return [], [], f"No pude descargar la página: {e}", ""
+    try:
+        tablas = pd.read_html(_io.StringIO(html))
+    except Exception as e:
+        return [], [], f"No encontré tablas legibles ({e}).", ""
+    rx = re.compile(r"(\d+)\s*[–—:\-]\s*(\d+)")
+    jugados, pend = [], []
+    doble = False; encontrados = 0
+    for t in tablas:
+        n = len(t)
+        if n < 4 or len(t.columns) != n + 1:
+            continue
+        nombres, ok = [], True
+        for _, row in t.iterrows():
+            nm = str(row.iloc[0]).strip()
+            nm = re.sub(r"\s*\[[^\]]*\]", "", nm)
+            nm = re.sub(r"\s*\([^)]*\)\s*$", "", nm).strip()
+            if not nm or nm.lower() == "nan" or rx.search(nm):
+                ok = False; break
+            nombres.append(nm)
+        if not ok or len(set(nombres)) != n:
+            continue
+        encontrados += 1
+        mat = {}
+        for i in range(n):
+            for j in range(1, n + 1):
+                if j - 1 == i:
+                    continue
+                a, b = nombres[i], nombres[j - 1]
+                m = rx.search(str(t.iat[i, j]))
+                mat[(a, b)] = (int(m.group(1)), int(m.group(2))) if m else None
+        if any(v is not None and mat.get((b, a)) is not None for (a, b), v in mat.items()):
+            doble = True
+        for (a, b), v in mat.items():
+            if v is not None:
+                jugados.append((a, b, v[0], v[1]))
+        vistos = set()
+        for (a, b), v in mat.items():
+            if v is None:
+                if doble:
+                    pend.append((a, b))
+                else:
+                    key = frozenset((a, b))
+                    if key in vistos:
+                        continue
+                    vistos.add(key)
+                    if mat.get((b, a)) is None:
+                        pend.append((a, b))
+    if not encontrados:
+        return [], [], ("No encontré la tabla cruzada (matriz equipo × equipo) en esa página. "
+                        "Probá con la página de Wikipedia del torneo, o pegá el fixture a mano."), ""
+    nota = "torneo ida y vuelta" if doble else "una sola rueda (si en realidad es ida y vuelta recién arrancado, revisá los «Restan»)"
+    return jugados, pend, None, nota
+
+def tabla_desde_url(url):
+    """Lee una tabla de posiciones desde una URL (ej. Wikipedia) y la devuelve como texto
+    «Equipo, Pts, PJ, DG» listo para el modo tabla. Devuelve (texto, error)."""
+    import requests as _rq, io as _io
+    try:
+        html = _rq.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text
+    except Exception as e:
+        return "", f"No pude descargar la página: {e}"
+    try:
+        tablas = pd.read_html(_io.StringIO(html))
+    except Exception as e:
+        return "", f"No encontré tablas legibles en esa página ({e})."
+    def _cols(t):
+        if isinstance(t.columns, pd.MultiIndex):
+            return [_zlow(str(c[-1])) for c in t.columns]
+        return [_zlow(str(c)) for c in t.columns]
+    def _busca(cols, nombres):
+        for i, c in enumerate(cols):
+            if c in nombres:
+                return i
+        return None
+    def _extraer(t):
+        cols = _cols(t)
+        i_pts = _busca(cols, {"pts", "pts.", "puntos"})
+        i_pj = _busca(cols, {"pj", "j", "jug", "jj", "part", "pj."})
+        i_dg = _busca(cols, {"dg", "dif", "dif.", "+/-", "dif. de gol", "dg.", "dif de gol"})
+        i_eq = _busca(cols, {"equipo", "club", "team", "equipos"})
+        if i_eq is None:
+            for i in range(len(cols)):
+                if t.dtypes.iloc[i] == object:
+                    i_eq = i; break
+        if i_pts is None or i_eq is None:
+            return []
+        out = []
+        for _, row in t.iterrows():
+            raw = str(row.iloc[i_eq]).strip()
+            name = re.sub(r"\s*\[[^\]]*\]", "", raw)
+            name = re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
+            if not name or name.lower() in ("nan", "equipo", "club", "equipos"):
+                continue
+            def _num(i):
+                if i is None: return None
+                m = re.search(r"[+-]?\d+", str(row.iloc[i]))
+                return int(m.group()) if m else None
+            pts = _num(i_pts)
+            if pts is None:
+                continue
+            pj = _num(i_pj) or 0
+            dg = _num(i_dg) or 0
+            out.append(f"{name}, {pts}, {pj}, {dg:+d}")
+        return out
+    mejor = []
+    for t in tablas:
+        try:
+            lineas = _extraer(t)
+        except Exception:
+            lineas = []
+        if len(lineas) > len(mejor):
+            mejor = lineas
+    if len(mejor) < 4:
+        return "", ("Leí la página pero no encontré una tabla de posiciones con filas cargadas. "
+                    "En algunos torneos (como la Liga Argentina por zonas) Wikipedia no trae esas tablas en el HTML: "
+                    "usá la tabla acumulada o de promedios, o pegá la tabla a mano.")
+    return "\n".join(mejor), None
+
+# ═══ API ESPN (gratis, sin token) — incluye Liga Argentina y ligas que no están en football-data ═══
+
+ESPN_LIGAS = {
+    "Argentina · Liga Profesional": "arg.1",
+    "Argentina · Copa Argentina": "arg.copa",
+    "Inglaterra · Premier League": "eng.1",
+    "España · LaLiga": "esp.1",
+    "Italia · Serie A": "ita.1",
+    "Alemania · Bundesliga": "ger.1",
+    "Francia · Ligue 1": "fra.1",
+    "EE.UU. · MLS": "usa.1",
+    "México · Liga MX": "mex.1",
+    "Copa Libertadores": "conmebol.libertadores",
+    "Copa Sudamericana": "conmebol.sudamericana",
+    "Champions League": "uefa.champions",
+    "Mundial FIFA": "fifa.world",
+}
+
+def _espn_get(url, timeout=30):
+    import requests as _rq
+    r = _rq.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ESPN respondió {r.status_code}")
+    return r.json()
+
+def espn_tabla(liga, timeout=30):
+    """Tabla de posiciones desde ESPN. Devuelve (base, zonas_sugeridas_txt, error)."""
+    lg = (liga or "").strip()
+    if not lg:
+        return {}, "", "Indicá el código de liga (ej.: arg.1)."
+    try:
+        data = _espn_get(f"https://site.api.espn.com/apis/v2/sports/soccer/{lg}/standings", timeout)
+    except Exception as e:
+        return {}, "", f"No pude conectar con ESPN: {e}"
+    base, notas = {}, {}
+    def _walk(node):
+        if isinstance(node, dict):
+            std = node.get("standings")
+            if isinstance(std, dict) and isinstance(std.get("entries"), list):
+                for ent in std["entries"]:
+                    nm = (ent.get("team") or {}).get("displayName")
+                    if not nm:
+                        continue
+                    sv = {}
+                    for s in ent.get("stats", []) or []:
+                        try:
+                            sv[s.get("name")] = int(float(s.get("value", 0) or 0))
+                        except Exception:
+                            pass
+                    base[nm] = {"pts": sv.get("points", 0), "pj": sv.get("gamesPlayed", 0),
+                                "dg": sv.get("pointDifferential", 0),
+                                "gf": sv.get("pointsFor", 0), "ga": sv.get("pointsAgainst", 0)}
+                    nota = (ent.get("note") or {}).get("description")
+                    rk = sv.get("rank", 0)
+                    if nota and rk:
+                        notas.setdefault(nota, []).append(rk)
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+    _walk(data)
+    if not base:
+        return {}, "", f"ESPN no devolvió tabla para «{lg}». Revisá el código de liga."
+    _TR = {"relegation": "Descenso", "relegation playoff": "Promoción", "champions league": "Libertadores/Champions",
+           "europa league": "Sudamericana/Europa", "conference league": "Conference",
+           "conference league playoff round": "Playoff Conference", "promotion": "Ascenso",
+           "playoffs": "Playoffs", "championship round": "Ronda campeonato"}
+    def _tr(n):
+        return _TR.get(_zlow(n).strip(), n)
+    zonas = "\n".join(f"{max(rs)} {_tr(n)}" for n, rs in sorted(notas.items(), key=lambda kv: max(kv[1])))
+    return base, zonas, None
+
+def espn_fixture(liga, dias=120, timeout=30, max_req=30):
+    """Partidos desde ESPN en una ventana de días. Devuelve (jugados, pendientes, nota, error)."""
+    import datetime as _dt
+    lg = (liga or "").strip()
+    try:
+        cab = _espn_get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}/scoreboard", timeout)
+    except Exception as e:
+        return [], [], "", f"No pude conectar con ESPN: {e}"
+    hoy = _dt.date.today() - _dt.timedelta(days=3); fin = _dt.date.today() + _dt.timedelta(days=int(dias))
+    cal = []
+    try:
+        for d in (cab.get("leagues") or [{}])[0].get("calendar", []) or []:
+            try:
+                f = _dt.datetime.strptime(str(d)[:10], "%Y-%m-%d").date()
+                if hoy <= f <= fin:
+                    cal.append(f)
+            except Exception:
+                pass
+    except Exception:
+        cal = []
+    jug, pen, vistos = [], [], set()
+    globals()["_ESPN_DIA"] = globals().get("_ESPN_DIA") or {}
+    def _absorber(js):
+        for ev in js.get("events", []) or []:
+            eid = ev.get("id")
+            if eid in vistos:
+                continue
+            comp = (ev.get("competitions") or [{}])[0]
+            cs = comp.get("competitors") or []
+            loc = next((c for c in cs if c.get("homeAway") == "home"), None)
+            vis = next((c for c in cs if c.get("homeAway") == "away"), None)
+            if not loc or not vis:
+                continue
+            ln = (loc.get("team") or {}).get("displayName"); vn = (vis.get("team") or {}).get("displayName")
+            if not ln or not vn:
+                continue
+            vistos.add(eid)
+            try:
+                _d = str(ev.get("date") or comp.get("date") or "")[:10]
+                if _d:
+                    globals()["_ESPN_DIA"][(ln, vn)] = _d
+            except Exception:
+                pass
+            t = ((comp.get("status") or {}).get("type") or {})
+            estado = str(t.get("state", "")).lower(); done = bool(t.get("completed"))
+            nm = str(t.get("name", "")).upper()
+            if "POSTPON" in nm or "CANCEL" in nm or "ABANDON" in nm:
+                continue
+            if done or estado == "post":
+                try:
+                    jug.append((ln, vn, int(loc.get("score")), int(vis.get("score"))))
+                except Exception:
+                    pass
+            elif estado in ("pre", "in"):
+                pen.append((ln, vn))
+    url_r = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}/scoreboard?dates={hoy:%Y%m%d}-{fin:%Y%m%d}"
+    nota = ""
+    try:
+        _absorber(_espn_get(url_r, timeout))
+    except Exception:
+        pass
+    if not pen and cal:
+        usar = cal[:max_req]
+        if len(cal) > max_req:
+            nota = f"(limité a las próximas {max_req} fechas del calendario)"
+        for f in usar:
+            try:
+                _absorber(_espn_get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}/scoreboard?dates={f:%Y%m%d}", timeout))
+            except Exception:
+                pass
+    if not jug and not pen:
+        return [], [], "", ("ESPN no devolvió partidos en esa ventana. Probá ampliar los días "
+                            "o revisá el código de liga.")
+    return jug, pen, nota, None
+
+def espn_lpf_zonas(liga="arg.1", timeout=30):
+    """Trae la tabla separada por zonas (ESPN devuelve un 'child' por grupo).
+    Devuelve ({'A': base, 'B': base}, error)."""
+    lg = (liga or "arg.1").strip()
+    try:
+        data = _espn_get(f"https://site.api.espn.com/apis/v2/sports/soccer/{lg}/standings", timeout)
+    except Exception as e:
+        return {}, f"No pude conectar con ESPN: {e}"
+    grupos = []
+    def _walk(node):
+        if isinstance(node, dict):
+            std = node.get("standings")
+            if isinstance(std, dict) and isinstance(std.get("entries"), list) and std["entries"]:
+                base = {}
+                for ent in std["entries"]:
+                    nm = (ent.get("team") or {}).get("displayName")
+                    if not nm:
+                        continue
+                    sv = {}
+                    for s2 in ent.get("stats", []) or []:
+                        try:
+                            sv[s2.get("name")] = int(float(s2.get("value", 0) or 0))
+                        except Exception:
+                            pass
+                    base[nm] = {"pts": sv.get("points", 0), "pj": sv.get("gamesPlayed", 0),
+                                "dg": sv.get("pointDifferential", 0),
+                                "gf": sv.get("pointsFor", 0), "ga": sv.get("pointsAgainst", 0)}
+                if base:
+                    grupos.append((str(node.get("name") or node.get("abbreviation") or ""), base))
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+    _walk(data)
+    if not grupos:
+        return {}, f"ESPN no devolvió tabla para «{lg}»."
+    if len(grupos) == 1:
+        return {}, ("ESPN devolvió una sola tabla (sin las zonas A y B separadas). "
+                    "Pegá las dos tablas en el panel para el modo LPF.")
+    Z = {}
+    for nombre, base in grupos[:2]:
+        m = re.search(r"\b([AB])\b", nombre.upper())
+        lab = m.group(1) if m else ("A" if "A" not in Z else "B")
+        while lab in Z:
+            lab = "B" if lab == "A" else "A"
+        Z[lab] = canon_base(base)
+    return Z, None
+
+def traer_de_apify(token, actor, input_json, timeout=120):
+    """Corre un actor de Apify en modo sync y devuelve los items del dataset (lista de dicts)."""
+    import requests as _rq, json as _json
+    act = (actor or "").strip().replace("/", "~")
+    if not act:
+        raise ValueError("Indicá el actor (ej.: crawlerbros/flashscore-scraper).")
+    try:
+        inp = _json.loads(input_json) if str(input_json or "").strip() else {}
+    except Exception:
+        raise ValueError("El input del actor no es JSON válido.")
+    url = f"https://api.apify.com/v2/acts/{act}/run-sync-get-dataset-items?token={token}&format=json"
+    r = _rq.post(url, json=inp, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Apify respondió {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    if isinstance(data, dict):
+        for k in ("items", "data"):
+            if isinstance(data.get(k), list):
+                return data[k]
+    return data if isinstance(data, list) else []
+
+def _match_eq(nombre, equipos):
+    """Empareja un nombre externo (Flashscore/SofaScore) con los equipos ya cargados, tolerando variantes."""
+    nn = _zlow(nombre)
+    for e in equipos:
+        if _zlow(e) == nn:
+            return e
+    for e in equipos:
+        ee = _zlow(e)
+        if ee in nn or nn in ee:
+            return e
+    tn = set(nn.split())
+    mejor, score = None, 0
+    for e in equipos:
+        s = len(tn & set(_zlow(e).split()))
+        if s > score:
+            mejor, score = e, s
+    return mejor if score else None
+
+def mapear_fixture(pend, equipos):
+    out, caidos = [], []
+    for a, b in pend:
+        ca_, cb_ = canon_club(a), canon_club(b)
+        ma = ca_ if ca_ in equipos else _match_eq(a, equipos)
+        mb = cb_ if cb_ in equipos else _match_eq(b, equipos)
+        if ma and mb and ma != mb:
+            out.append((ma, mb))
+        else:
+            caidos.append(f"{a} vs {b}")
+    return out, caidos
+
+def importar_partidos_json(texto, filtro=""):
+    """Convierte un export de Apify (JSON/NDJSON/CSV) u otra fuente en (jugados, pendientes, ligas, error).
+    Reconoce homeTeam/awayTeam/homeScore/awayScore/status/league-tournament con varios alias."""
+    import json as _json, csv as _csv, io as _io
+    txt = (texto or "").strip()
+    if not txt:
+        return [], [], {}, "Pegá el contenido exportado (JSON o CSV)."
+    recs = []
+    try:
+        data = _json.loads(txt)
+        if isinstance(data, dict):
+            for k in ("items", "data", "results", "matches"):
+                if isinstance(data.get(k), list):
+                    data = data[k]; break
+        if isinstance(data, list):
+            recs = [r for r in data if isinstance(r, dict)]
+    except Exception:
+        nd = []
+        for ln in txt.splitlines():
+            ln = ln.strip().rstrip(",")
+            if ln.startswith("{") and ln.endswith("}"):
+                try: nd.append(_json.loads(ln))
+                except Exception: pass
+        recs = nd
+    if not recs and ("," in txt or ";" in txt):
+        try:
+            head = txt.splitlines()[0]
+            delim = ";" if head.count(";") > head.count(",") else ","
+            recs = [dict(r) for r in _csv.DictReader(_io.StringIO(txt), delimiter=delim)]
+        except Exception:
+            recs = []
+    if not recs:
+        return [], [], {}, "No reconocí el formato. Pegá el JSON del actor (lista de partidos) o un CSV con encabezado."
+    def pick(r, *keys):
+        low = {str(k).lower(): v for k, v in r.items()}
+        for k in keys:
+            v = low.get(k.lower())
+            if v not in (None, ""):
+                return v
+        return None
+    fl = _zlow(filtro or "")
+    jugados, pendientes, ligas = [], [], {}
+    for r in recs:
+        liga = str(pick(r, "league", "tournament", "liga", "competition", "torneo") or "").strip()
+        if liga:
+            ligas[liga] = ligas.get(liga, 0) + 1
+        if fl and fl not in _zlow(liga):
+            continue
+        h = pick(r, "homeTeam", "home_team", "home", "local", "homeName")
+        a = pick(r, "awayTeam", "away_team", "away", "visitante", "awayName")
+        if not h or not a:
+            continue
+        h, a = str(h).strip(), str(a).strip()
+        hs, asn = pick(r, "homeScore", "home_score", "golesLocal"), pick(r, "awayScore", "away_score", "golesVisitante")
+        stt = _zlow(str(pick(r, "status", "estado") or ""))
+        try:
+            hs, asn = int(str(hs).strip()), int(str(asn).strip())
+        except Exception:
+            hs = asn = None
+        fin = any(w in stt for w in ("finish", "final", "termin", "ended", "after", "ft"))
+        if hs is not None and asn is not None and (fin or not stt):
+            jugados.append((h, a, hs, asn))
+        elif not any(w in stt for w in ("postpon", "cancel", "aband", "suspend", "walkover", "aplaz")):
+            pendientes.append((h, a))
+    return jugados, pendientes, ligas, ""
+
+# ── PROMEDIOS (descenso a la argentina: puntos ÷ partidos de las últimas temporadas) ──
+
+def parse_promedios(texto):
+    """Líneas «Equipo, pts, pj» o «Equipo, pts1, pj1, pts2, pj2» (temporadas PREVIAS; se suman).
+    La temporada actual la toma sola de la tabla cargada. Devuelve {equipo: (pts_prev, pj_prev)}."""
+    out = {}
+    for ln in (texto or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        partes = [p.strip() for p in re.split(r"[;,\t]|\s{2,}", ln) if p.strip()]
+        if len(partes) < 3:
+            continue
+        nombre = partes[0]
+        nums = [int(p) for p in partes[1:] if re.fullmatch(r"[+-]?\d+", p)]
+        if len(nums) < 2:
+            continue
+        nums = nums[: (len(nums) // 2) * 2]
+        pts, pj = sum(nums[0::2]), sum(nums[1::2])
+        if pj > 0 and nombre:
+            out[nombre] = (pts, pj)
+    return out
+
+def _asignar_nombres(claves, equipos):
+    """Empareja nombres externos con los equipos cargados sin confundir casos como
+    «Estudiantes» vs «Estudiantes RC» o «Gimnasia» vs «Gimnasia (M)».
+    1) primero los exactos, 2) después los parciales solo si son únicos y el equipo sigue libre."""
+    libres = list(equipos); out = {}
+    for k in list(claves):
+        for e in list(libres):
+            if _zlow(k) == _zlow(e):
+                out[k] = e; libres.remove(e); break
+    for k in [x for x in claves if x not in out]:
+        kn = _zlow(k)
+        cands = [e for e in libres if kn in _zlow(e) or _zlow(e) in kn]
+        if len(cands) == 1:
+            out[k] = cands[0]; libres.remove(cands[0])
+    return out
+
+def _prom_rangos(base, rest, prev):
+    """Por equipo: (promedio_hoy, piso = perdiendo todo, techo = ganando todo). Empareja nombres tolerante."""
+    eqs = list(base.keys())
+    mapped = {}
+    asign = _asignar_nombres(list((prev or {}).keys()), eqs)
+    for nombre, (pp, jp) in (prev or {}).items():
+        m = asign.get(nombre)
+        if m:
+            mapped[m] = (pp, jp)
+    out = {}
+    for e in eqs:
+        pa, ja = base[e]["pts"], base[e].get("pj", 0)
+        pp, jp = mapped.get(e, (0, 0))
+        tp, tj = pa + pp, ja + jp
+        r = rest.get(e, 0)
+        hoy = tp / tj if tj else 0.0
+        piso = tp / (tj + r) if (tj + r) else 0.0
+        techo = (tp + 3 * r) / (tj + r) if (tj + r) else 0.0
+        out[e] = {"hoy": hoy, "piso": piso, "techo": techo, "tp": tp, "tj": tj, "r": r, "con_prev": e in mapped}
+    return out
+
+def promedios_df(base, rest, prev):
+    P = _prom_rangos(base, rest, prev)
+    rows = [{"Equipo": e, "PROMEDIO": round(d["hoy"], 3), "Pts": d["tp"], "PJ": d["tj"],
+             "Piso": round(d["piso"], 3), "Techo": round(d["techo"], 3),
+             "Previas": "sí" if d["con_prev"] else "solo actual"} for e, d in P.items()]
+    df = pd.DataFrame(rows).sort_values("PROMEDIO", ascending=False).reset_index(drop=True)
+    df.insert(0, "Pos", range(1, len(df) + 1))
+    return df
+
+def promedio_que_necesita_texto(e, base, rest, prev, k=1):
+    if e not in base:
+        return f"No encuentro a {e} en la tabla cargada."
+    P = _prom_rangos(base, rest, prev)
+    n = len(P); d = P[e]
+    df = promedios_df(base, rest, prev); pos = int(df[df["Equipo"] == e]["Pos"].iloc[0])
+    abajo_seguro = sorted([x for x in P if x != e and P[x]["techo"] < d["piso"]], key=lambda x: P[x]["techo"])
+    arriba_seguro = sorted([x for x in P if x != e and P[x]["piso"] > d["techo"]], key=lambda x: -P[x]["piso"])
+    L = [f"**¿{e} y el descenso por promedios?** (descienden los {k} peores)",
+         f"Está {pos}º de {n} con promedio **{d['hoy']:.3f}** ({d['tp']} pts en {d['tj']} PJ, contando temporadas previas). "
+         f"Perdiendo todo baja a {d['piso']:.3f}; ganando todo sube a {d['techo']:.3f}."]
+    if len(abajo_seguro) >= k:
+        muestra = ", ".join(abajo_seguro[:4])
+        L.append(f"✅ **Ya está a salvo del promedio**: aunque pierda todo lo que le queda, {muestra} "
+                 f"no lo pueden superar ni ganando todo (sus techos quedan por debajo de tu piso).")
+    elif len(arriba_seguro) >= n - k:
+        L.append(f"❌ **Condenado por promedio**: aun ganando todo llega a {d['techo']:.3f} y ya hay "
+                 f"{len(arriba_seguro)} equipos que ni perdiendo todo bajan de ese número.")
+    else:
+        pelea = sorted([x for x in P if x != e and not (P[x]["techo"] < d["piso"]) and not (P[x]["piso"] > d["techo"])],
+                       key=lambda x: P[x]["hoy"])
+        techos = sorted((P[x]["techo"] for x in P if x != e))
+        objetivo = techos[k - 1] if len(techos) >= k else 0.0
+        den = d["tj"] + d["r"]
+        need = objetivo * den - d["tp"]
+        import math
+        pts_need = max(0, math.ceil(need + 1e-9))
+        if pelea:
+            L.append("⚔️ **Pelea mano a mano con:** " + ", ".join(pelea[:6]) + ".")
+        if d["r"] and pts_need <= 3 * d["r"]:
+            L.append(f"Para salvarse **sin depender de nadie** necesita sumar **{pts_need} pts** de los {3*d['r']} en juego "
+                     f"(así su promedio supera el techo del {k}º peor).")
+        else:
+            L.append("Ni ganando todo se asegura solo: necesita sumar **y** que los de abajo pinchen.")
+    L.append("_Exacto por rangos de promedio (piso y techo). Los recién ascendidos computan solo la temporada actual: así es la regla. "
+             "Cargá las temporadas previas en el panel «📉 Promedios»._")
+    return "\n\n".join(L)
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# LPF 2026 — Liga Profesional Argentina (Reglamento Torneos Primera División 2026)
+# Zonas A y B de 15, una rueda, 16 fechas. Top 8 de cada zona → Octavos (art. 8.2/14.2).
+# Tabla General 2026 = fase de zonas del Apertura + fase de zonas del Clausura (art. 24.1).
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+LPF_ZONAS_PLAYOFF = [(8, "Playoffs", "#1b5e20"), (15, "Afuera", "#eef1e8")]
+LPF_OCTAVOS = [(1, "A", 8, "B"), (1, "B", 8, "A"), (2, "A", 7, "B"), (2, "B", 7, "A"),
+               (3, "A", 6, "B"), (3, "B", 6, "A"), (4, "A", 5, "B"), (4, "B", 5, "A")]
+
+def lpf_zona_de_equipo(e, Z):
+    for lab, base in (Z or {}).items():
+        if e in base:
+            return lab
+    return None
+
+def lpf_playoffs_texto(equipo, Z, rest, pend=None):
+    """Informe de playoffs con el mismo molde que copas: conclusión arriba, la cuenta
+    a la vista, condiciones explícitas y letra chica al final."""
+    lab = lpf_zona_de_equipo(equipo, Z)
+    if not lab:
+        return f"No encuentro a **{equipo}** en las zonas cargadas."
+    base = Z[lab]
+    k = _LPF_TOP_OCTAVOS
+    pts = {e: base[e]["pts"] for e in base}
+    gx = rest.get(equipo, 0); mio = pts[equipo]; techo = mio + 3 * gx
+    pos = 1 + sum(1 for x in base if x != equipo and
+                  (pts[x], base[x].get("dg", 0), base[x].get("gf", 0)) >
+                  (mio, base[equipo].get("dg", 0), base[equipo].get("gf", 0)))
+    estado = _liga_in_out(equipo, base, rest, k)
+    if estado == "in":
+        titular = f"{equipo} ya está clasificado a los octavos."
+    elif estado == "out":
+        titular = f"{equipo} quedó sin chances de clasificar a los octavos."
+    else:
+        _lin = _linea_garantia(base, rest, pend, equipo, k)
+        titular = (f"{equipo} depende de sí mismo para meterse en los octavos."
+                   if (_lin + 1 - mio) <= 3 * gx else
+                   f"{equipo} no puede asegurar solo la clasificación: necesita ganar y que los de arriba pinchen.")
+    L = [f"## {equipo} · Playoffs (Zona {lab})", f"**{titular}**",
+         f"Hoy está **{pos}º** de su zona con **{mio} puntos** y **{gx} partidos** por jugar "
+         f"({3*gx} en juego). Clasifican los **8 primeros**."]
+    L += _copas_bloque_objetivo(equipo, base, rest, pend, k, "Octavos")
+    if pend:
+        mis = [(b if a == equipo else a) for (a, b) in pend if equipo in (a, b)]
+        if mis:
+            L.append("### Los partidos que le quedan")
+            L.append(" · ".join(mis))
+    L.append("### Cómo leer estos números")
+    L.append("Los puntos que se piden son un **piso seguro**: alcanzándolos clasifica fijo, pase lo que pase. "
+             "Con menos también puede entrar, pero ahí depende de que los rivales se queden cortos.")
+    L.append("_Art. 14.1.2: si un club termina en zona de descenso o debe jugar un desempate por el descenso, "
+             "no puede jugar las instancias finales; su lugar lo ocupa el siguiente mejor ubicado de su zona._")
+    return "\n\n".join(L)
+
+def lpf_cruces_texto(Z):
+    if len(Z or {}) < 2:
+        return "Necesito las dos zonas cargadas (A y B) para armar los cruces."
+    ord_ = {lab: liga_tabla_df(base) for lab, base in Z.items()}
+    def eq(lab, pos):
+        df = ord_.get(lab)
+        if df is None or len(df) < pos:
+            return "—"
+        r = df.iloc[pos - 1]
+        return f"{r['Equipo']} ({int(r['PTS'])})"
+    L = ["**Octavos de Final si la fase de zonas terminara hoy** (art. 14.2):"]
+    for i, (pa, za, pb, zb) in enumerate(LPF_OCTAVOS, 1):
+        L.append(f"**Partido {i}:** {pa}º Zona {za} — {eq(za, pa)}  vs  {pb}º Zona {zb} — {eq(zb, pb)}")
+    L.append("_Partido único, en cancha del mejor ubicado en la fase de zonas. "
+             "Cuartos: G1-G8, G2-G7, G3-G6, G4-G5 (art. 14.3)._")
+    return "\n\n".join(L)
+
+def lpf_anual_base(Z, apertura=None):
+    """Tabla General 2026 (art. 24.1). Si se cargó la anual directa, se usa esa;
+    si no, suma Apertura + Clausura."""
+    directa = (st.session_state.get("ESTADO") or {}).get("anual_directo")
+    if directa:
+        return dict(directa)
+    out = {}
+    ap = apertura or {}
+    claves = list(ap.keys())
+    todos = [e for b in (Z or {}).values() for e in b]
+    asign = _asignar_nombres(claves, todos) if claves else {}
+    inv = {v: k for k, v in asign.items()}
+    for lab, base in (Z or {}).items():
+        for e, d in base.items():
+            a = ap.get(inv.get(e, ""), {})
+            out[e] = {"pts": d.get("pts", 0) + a.get("pts", 0),
+                      "pj": d.get("pj", 0) + a.get("pj", 0),
+                      "dg": d.get("dg", 0) + a.get("dg", 0),
+                      "gf": d.get("gf", 0) + a.get("gf", 0),
+                      "ga": d.get("ga", 0) + a.get("ga", 0)}
+    return out
+
+def lpf_anual_df(Z, apertura=None):
+    return liga_tabla_df(lpf_anual_base(Z, apertura))
+
+def lpf_descenso_texto(Z, rest, apertura=None, prev=None, n_anual=1, n_prom=1, equipo=None, pend=None):
+    anual = lpf_anual_base(Z, apertura)
+    n = len(anual)
+    if n < 4:
+        return "Cargá las dos zonas para calcular el descenso."
+    L = [f"**Descenso 2026** — bajan **{n_anual}** por la Tabla General (anual) y **{n_prom}** por promedios "
+         f"(art. 26; la cantidad la fija el Estatuto de AFA, art. 93)."]
+    zonas_anual = [(n - n_anual, "Permanece", "#eef1e8"), (n, "Descenso", "#b71c1c")]
+    if equipo:
+        if equipo not in anual:
+            return f"No encuentro a **{equipo}** en las zonas cargadas."
+        k_salvarse = max(1, n - n_anual)
+        pts_e = anual[equipo]["pts"]; gx = rest.get(equipo, 0); techo = pts_e + 3 * gx
+        pos_anual = 1 + sum(1 for x in anual if x != equipo and
+                            (anual[x]["pts"], anual[x].get("dg", 0), anual[x].get("gf", 0)) >
+                            (pts_e, anual[equipo].get("dg", 0), anual[equipo].get("gf", 0)))
+        est = _liga_in_out(equipo, anual, rest, k_salvarse)
+        if est == "in":
+            tit = f"{equipo} ya está salvado por la Tabla General."
+        elif est == "out":
+            tit = f"{equipo} no puede escapar del último puesto de la Tabla General."
+        else:
+            _lin = _linea_garantia(anual, rest, pend, equipo, k_salvarse)
+            tit = (f"{equipo} depende de sí mismo para salvarse por la Tabla General."
+                   if (_lin + 1 - pts_e) <= 3 * gx else
+                   f"{equipo} no se salva solo por la anual: necesita sumar y que los de abajo no lo pasen.")
+        L = [f"## {equipo} · Descenso 2026", f"**{tit}**",
+             f"Bajan **{n_anual}** por la Tabla General y **{n_prom}** por promedios. "
+             f"Hay que zafar de **las dos** tablas: alcanza con caer en una para descender.",
+             f"En la anual está **{pos_anual}º de {n}** con **{pts_e} puntos** y **{gx} partidos** por jugar "
+             f"({3*gx} en juego); su techo es **{techo}**."]
+        L.append("## Vía 1 · Tabla General (anual)")
+        L += _copas_bloque_objetivo(equipo, anual, rest, pend, k_salvarse, "Permanencia por la anual", modo="salvarse")
+        L.append("## Vía 2 · Promedios")
+        L.append(promedio_que_necesita_texto(equipo, anual, rest, prev or {}, n_prom))
+        if pend:
+            mis = [(b if a == equipo else a) for (a, b) in pend if equipo in (a, b)]
+            if mis:
+                L.append("### Los partidos que le quedan")
+                L.append(" · ".join(mis))
+        L.append("### Cómo leer estos números")
+        L.append("Los puntos que se piden son un **piso seguro**: alcanzándolos se salva fijo por esa vía, pase lo que "
+                 "pase. Con menos también puede zafar, pero ahí depende de que los de abajo no sumen.")
+        L.append(f"**Regla clave:** si el mismo equipo termina último en las dos tablas, desciende por promedios y el "
+                 f"segundo descenso pasa al siguiente peor de la anual (Estatuto AFA, art. 93).")
+    else:
+        df = liga_tabla_df(anual)
+        dfp = promedios_df(anual, rest, prev or {})
+        # Regla: primero baja el último del PROMEDIO; el segundo descenso sale de la ANUAL
+        # excluyendo al que ya bajó por promedio (si es el mismo, pasa al anteúltimo).
+        por_prom = list(dfp.tail(n_prom)["Equipo"])
+        por_anual = [e for e in list(df["Equipo"]) if e not in por_prom][-n_anual:] if n_anual else []
+        L.append(f"**Baja por promedios:** {', '.join(por_prom)}" +
+                 ("" if (prev or {}) else " _(sin temporadas previas cargadas: el promedio sale solo del 2026)_") + ".")
+        L.append(f"**Baja por la Tabla General (anual):** {', '.join(por_anual)}.")
+        ultimo_anual = list(df.tail(1)["Equipo"])[0]
+        if ultimo_anual in por_prom:
+            L.append(f"_{ultimo_anual} es último en **las dos tablas**: desciende por promedios, y el segundo descenso "
+                     f"recae en el siguiente peor de la anual (**{', '.join(por_anual)}**)._")
+    L.append("_En posiciones que definen descenso, un empate en puntos NO se define por diferencia de gol: "
+             "se juega un partido desempate (art. 26.2 y 111 del Reglamento General de AFA)._")
+    return "\n\n".join(L)
+
+def lpf_plazas_copas(Z, apertura=None, camps=("", "", ""), extras=("", "")):
+    """Reparte las plazas 2027 según arts. 27 y 28, contemplando el REORDENAMIENTO.
+    camps = (campeón Apertura, campeón Clausura, campeón Copa Argentina)
+    extras = (campeón Libertadores 2026 argentino, campeón Sudamericana 2026 argentino)
+    Devuelve dict con lib=[(equipo, motivo)], n_tabla_lib, reducida, avisos."""
+    anual = lpf_anual_base(Z, apertura)
+    orden = list(liga_tabla_df(anual)["Equipo"])
+    def norm(x):
+        x = (x or "").strip()
+        return (_match_eq(x, orden) or "") if x else ""
+    ca, cc, cq = [norm(x) for x in camps]
+    xl, xs = [norm(x) for x in extras]
+    lib, avisos = [], []
+    def ya(e):
+        return any(e == x for x, _ in lib)
+    def poner(e, motivo):
+        if e and not ya(e):
+            lib.append((e, motivo)); return True
+        return False
+    # Plazas adicionales por título internacional (arts. 27.9 y 27.10)
+    if xl:
+        poner(xl, "Campeón de la Libertadores 2026 — plaza adicional (art. 27.9)")
+    if xs:
+        poner(xs, "Campeón de la Sudamericana 2026 — plaza adicional (art. 27.10)")
+    n_base = 6  # plazas ARGENTINA 1 a 6 (arts. 27.1 a 27.6)
+    # Plazas por título nacional
+    for e, motivo, art in ((ca, "Campeón del Apertura", "27.1"), (cc, "Campeón del Clausura", "27.2")):
+        if e:
+            if ya(e):
+                avisos.append(f"{e} ya tenía plaza, así que su lugar como {motivo} lo toma el siguiente mejor de la anual (art. 27.7/27.9).")
+            else:
+                poner(e, f"{motivo} (art. {art})")
+                n_base -= 1
+    if cq:
+        if ya(cq):
+            avisos.append(f"{cq} (Copa Argentina) ya tenía plaza: **ARGENTINA 3 la hereda el mejor equipo de Primera de la Copa Argentina 2026**, "
+                          f"no el siguiente de la anual (art. 27.8). Ese dato no sale de la tabla: cargalo a mano.")
+            n_base -= 1
+        else:
+            poner(cq, "Campeón de la Copa Argentina (art. 27.3, plaza inalterable)")
+            n_base -= 1
+    else:
+        avisos.append("Falta el campeón de la **Copa Argentina 2026**: esa plaza es inalterable (art. 27.3) y se descuenta de los cupos por tabla.")
+        n_base -= 1
+    if not ca:
+        avisos.append("Falta el campeón del **Apertura**."); n_base -= 1
+    if not cc:
+        avisos.append("Falta el campeón del **Clausura** (se define en los playoffs)."); n_base -= 1
+    n_tabla_lib = max(0, n_base)
+    tomados = [e for e, _ in lib]
+    reducida = [e for e in orden if e not in tomados]
+    for k, e in enumerate(reducida[:n_tabla_lib]):
+        lib.append((e, f"por Tabla General ({orden.index(e)+1}º de la anual; {k+1}º sin contar a los campeones) — arts. 27.4 a 27.6"))
+    return {"lib": lib, "n_tabla_lib": n_tabla_lib, "orden": orden, "reducida": reducida,
+            "avisos": avisos, "anual": anual, "tomados": [e for e, _ in lib]}
+
+def lpf_copas_texto(Z, apertura=None, camp_apertura="", camp_clausura="", camp_copa_arg="",
+                    camp_lib26="", camp_sud26=""):
+    if len((Z or {})) < 2:
+        return "Cargá las dos zonas para calcular las plazas a las copas."
+    P = lpf_plazas_copas(Z, apertura, (camp_apertura, camp_clausura, camp_copa_arg), (camp_lib26, camp_sud26))
+    orden, red, n_t = P["orden"], P["reducida"], P["n_tabla_lib"]
+    L = ["**Clasificación a copas 2027** (arts. 27 y 28 del Reglamento LPF 2026)"]
+    L.append("### 🏆 Copa Libertadores 2027")
+    for i, (e, motivo) in enumerate(P["lib"], 1):
+        L.append(f"**{i}.** {e} — {motivo}")
+    L.append(f"**Cupos que se reparten por la Tabla General: {n_t}.** "
+             f"Por la anual entran los **{n_t} mejores que no tengan plaza** (no necesariamente los {n_t} primeros). "
+             "Si Apertura y Clausura tienen el mismo campeón, su plaza duplicada sí corre a la anual (art. 27.7). "
+             "Una duplicación del campeón de Copa Argentina se resuelve dentro de esa Copa, no por la anual (art. 27.8).")
+    sud = [e for e in red[n_t:]][:6]
+    L.append("### 🥈 Copa Sudamericana 2027 (art. 28.1: los 6 mejores de la anual sin plaza en Libertadores)")
+    for i, e in enumerate(sud, 1):
+        L.append(f"**ARGENTINA {i}** · {e} ({orden.index(e)+1}º de la anual)")
+    if P["avisos"]:
+        L.append("**⚠️ Ojo:**")
+        for a in P["avisos"]:
+            L.append(f"- {a}")
+    L.append("_Un campeón que descienda pierde la plaza y se corre el orden (art. 28.2.1); si el campeón de la Copa Argentina "
+             "es del ascenso o desciende, su plaza va al mejor equipo de Primera de esa Copa (art. 28.2.2)._")
+    return "\n\n".join(L)
+
+def _combos_puntos(faltan, juegos):
+    """Combinaciones (ganados, empatados) que suman **al menos** `faltan` puntos.
+    Importante: la meta es un piso, así que superarla también sirve; por eso no se
+    exige la igualdad exacta. Se devuelven las opciones con menos triunfos primero."""
+    out = []
+    for g in range(0, juegos + 1):
+        # con g triunfos, empates mínimos para alcanzar la meta
+        e = max(0, faltan - 3 * g)
+        if e <= juegos - g:
+            out.append((g, e))
+    out.sort(key=lambda ge: (ge[0], ge[1]))
+    return out
+
+def _texto_combos(faltan, juegos):
+    cs = _combos_puntos(faltan, juegos)
+    if not cs:
+        return ""
+    g0, e0 = cs[0]
+    total0 = 3 * g0 + e0
+    partes = []
+    for g, e in cs[:3]:
+        p = f"**{g} triunfo{'s' if g != 1 else ''}**"
+        if e:
+            p += f" + {e} empate{'s' if e != 1 else ''}"
+        pierde = juegos - g - e
+        p += f" y {pierde} derrota{'s' if pierde != 1 else ''}" if pierde > 0 else " (gana o empata todos)"
+        p += f" = {3*g + e}"
+        partes.append(p)
+    txt = "**Cómo llegar** (sirve alcanzar la meta *o superarla*): " + " · ".join(partes) + "."
+    margen = juegos - g0 - e0
+    if margen == 0:
+        txt += (" Con el mínimo de triunfos no le sobra ningún partido; ganando alguno más sí puede permitirse "
+                "una derrota.") if len(cs) > 1 else " No le sobra ningún partido: tiene que puntuar en todos."
+    return txt
+
+def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="entrar"):
+    """Un objetivo explicado con la cuenta a la vista y las condiciones concretas.
+    `modo`: "entrar" (playoffs/copas) o "salvarse" (descenso), sólo cambia el lenguaje."""
+    _salva = (modo == "salvarse")
+    _V = "se salva" if _salva else "entra"
+    _VINF = "salvarse" if _salva else "entrar"
+    pts = {e: base_red[e]["pts"] for e in base_red}
+    gx = rest.get(equipo, 0)
+    mio = pts[equipo]
+    techo = mio + 3 * gx
+    estado = _liga_in_out(equipo, base_red, rest, k)
+    if estado == "in":
+        return [f"### ✅ {nombre_obj}: " + ("ya está salvado" if _salva else "ya está adentro"),
+                f"Tiene {mio} puntos y ningún rival puede pasarlo aunque gane todo. No depende de nada."]
+    if estado == "out":
+        return [f"### ❌ {nombre_obj}: " + ("condenado matemáticamente" if _salva else "matemáticamente afuera"),
+                f"La cuenta: {mio} puntos + {gx} partidos × 3 = **{techo} como máximo**, y no alcanza."]
+    linea = _linea_garantia(base_red, rest, pend, equipo, k)
+    meta = linea + 1
+    faltan = max(0, meta - mio)
+    L = []
+    pmax = {x: pts[x] + 3 * rest.get(x, 0) for x in base_red}
+    arriba_techo = sorted([(x, pmax[x]) for x in base_red if x != equipo and pmax[x] > techo],
+                          key=lambda kv: -kv[1])
+    if faltan > 3 * gx:
+        # ── No le alcanza solo: hay que decir QUÉ tienen que hacer los otros ──
+        L.append(f"### ⚠️ {nombre_obj}: no le alcanza con ganar todo")
+        L.append(f"**La cuenta:** tiene {mio} puntos y le quedan {gx} partidos. Ganándolos todos llega a "
+                 f"**{techo}**. Para {_VINF} sin depender de nadie necesitaría **{meta}**. Le faltan {meta - techo} "
+                 f"puntos que ya no existen: por eso necesita ayuda.")
+        ceden = max(0, len(arriba_techo) - (k - 1))
+        if arriba_techo:
+            lst = " · ".join(f"{x} (puede llegar a {m})" for x, m in arriba_techo[:6])
+            L.append(f"**La condición:** aun ganando todo terminaría con {techo}. Hay **{len(arriba_techo)} equipos** "
+                     f"que todavía pueden superar ese número: {lst}.")
+            L.append((f"Como se salvan {k}, " if _salva else f"Como a {nombre_obj} entran {k}, ") +
+                     f"necesita que **al menos {ceden} de ellos** terminen en {techo} o menos. "
+                     f"Es decir: ganar lo suyo y que esos rivales pierdan puntos en el camino.")
+    else:
+        # ── Depende de sí mismo: mostrar las combinaciones ──
+        L.append(f"### 🎯 {nombre_obj}: depende de sí mismo")
+        L.append(f"**La cuenta:** tiene {mio} puntos y necesita llegar a **{meta}**. "
+                 f"Le faltan **{faltan} puntos** de los {3*gx} que quedan en juego ({gx} partidos).")
+        cb = _texto_combos(faltan, gx)
+        if cb:
+            L.append(cb)
+        L.append(f"Con {meta} {_V} **pase lo que pase**. Con menos también puede {_VINF}, pero ahí ya depende de que "
+                 f"los rivales se queden cortos.")
+    # ── De dónde sale la meta (el porqué, pegado al número) ──
+    _quien = (f"el último equipo que se salva ({k}º)" if _salva else f"el equipo que quede {k}º")
+    L.append(f"**De dónde sale el {meta}:** {_quien} puede terminar como mucho con **{linea}** puntos, "
+             f"así que hay que superarlo. Ese tope no es la suma de los techos: cuando dos rivales juegan entre sí, "
+             f"los 3 puntos van a uno solo, y eso ya está descontado.")
+    otros = sorted(((x, pmax[x]) for x in base_red if x != equipo), key=lambda kv: -kv[1])
+    lo = max(0, k - 3); borde = otros[lo:k + 2]
+    if borde:
+        L.append("**Con quién pelea el corte:** " +
+                 " · ".join(f"{x} {pts[x]} {'pt' if pts[x] == 1 else 'pts'} (tope {m})" for x, m in borde) + ".")
+    if pend:
+        enpelea = {x for x in base_red if x != equipo and _liga_in_out(x, base_red, rest, k) == "pelea"}
+        h2h = [(b if a == equipo else a) for (a, b) in pend if equipo in (a, b) and (b if a == equipo else a) in enpelea]
+        if h2h:
+            rest2 = dict(rest)
+            for r in h2h:
+                rest2[r] = max(0, rest2.get(r, 0) - 1)
+            meta2 = _linea_garantia(base_red, rest2, pend, equipo, k) + 1
+            if len(h2h) <= 4 and meta2 < meta:
+                L.append(f"**El atajo:** ganándoles a {', '.join(h2h)} la meta baja de {meta} a **{meta2}**, "
+                         f"porque suma él y ellos se quedan sin sumar.")
+            else:
+                L.append(f"**El atajo:** {len(h2h)} de sus partidos son contra rivales que pelean este mismo lugar. "
+                         f"Ganar esos vale doble (suma él y frena al rival) y baja la meta; pesa sobre el final.")
+    return L
+
+def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""), extras=("", ""), pend=None):
+    """Informe de copas por la Tabla General: conclusión arriba, cada número con su
+    porqué al lado, los rivales una sola vez y la letra chica al final."""
+    if len((Z or {})) < 2:
+        return "Cargá las dos zonas."
+    P = lpf_plazas_copas(Z, apertura, camps, extras)
+    anual, red, n_t = P["anual"], P["reducida"], P["n_tabla_lib"]
+    if equipo in P["tomados"] and equipo not in red:
+        motivo = dict(P["lib"]).get(equipo, "")
+        return f"## {equipo} ya tiene su plaza\n\n{motivo}. No depende de la tabla anual."
+    if equipo not in anual:
+        return f"No encuentro a **{equipo}**."
+    base_red = {e: anual[e] for e in red}
+    n = len(base_red)
+    pos_red = red.index(equipo) + 1
+    k_lib = n_t
+    k_sud = min(n, n_t + 6)
+    e_lib = _liga_in_out(equipo, base_red, rest, k_lib)
+    e_sud = _liga_in_out(equipo, base_red, rest, k_sud)
+    pts_e = base_red[equipo]["pts"]; gx = rest.get(equipo, 0)
+
+    # ── TITULAR: la conclusión primero ──
+    if e_lib == "in":
+        titular = f"{equipo} ya tiene la Libertadores asegurada."
+    elif e_lib == "out" and e_sud == "out":
+        titular = f"{equipo} quedó sin chances de copa por la Tabla General."
+    elif e_lib == "out":
+        titular = f"{equipo} ya no llega a la Libertadores: su pelea es por la Sudamericana."
+    else:
+        _lin = _linea_garantia(base_red, rest, pend, equipo, k_lib)
+        if (_lin + 1 - pts_e) > 3 * gx:
+            titular = (f"{equipo} no puede asegurar solo la Libertadores: necesita ganar y que los de arriba pinchen. "
+                       f"Su objetivo realista es la Sudamericana.")
+        else:
+            titular = f"{equipo} pelea la Libertadores y depende de sí mismo."
+    L = [f"## {equipo} · Copas 2027", f"**{titular}**",
+         f"Hoy está **{pos_red}º** en la tabla que reparte las copas, con **{pts_e} puntos** "
+         f"y **{gx} partidos** por jugar ({3*gx} en juego)."]
+
+    # ── Cada objetivo, por separado ──
+    L += _copas_bloque_objetivo(equipo, base_red, rest, pend, k_lib, "Libertadores")
+    L += _copas_bloque_objetivo(equipo, base_red, rest, pend, k_sud, "Sudamericana")
+
+    # ── Rivales que le quedan: UNA sola vez ──
+    if pend:
+        mis = [(b if a == equipo else a) for (a, b) in pend if equipo in (a, b)]
+        if mis:
+            L.append("### Los partidos que le quedan")
+            L.append(" · ".join(mis))
+
+    # ── Letra chica ──
+    chica = ["### Cómo leer estos números",
+             f"La tabla que reparte copas es la **Tabla General sin los campeones**: entran **{n_t} a Libertadores** "
+             f"y los **6 siguientes a Sudamericana**."]
+    _camp_plaza = [(e, m) for (e, m) in P["lib"] if e not in red]
+    if _camp_plaza:
+        _cl = "; ".join(f"**{e}** ({m.split('(art')[0].split('—')[0].strip()})" for e, m in _camp_plaza)
+        chica.append(f"Ya tienen plaza y por eso salen de esta tabla: {_cl}. Al salir liberan lugar y corren la línea hacia abajo.")
+    chica.append("Los puntos que se piden son un **piso seguro**: alcanzándolos entra fijo, pase lo que pase. "
+                 "Con menos también puede entrar si los rivales se quedan cortos. En la Anual compite contra los 30 "
+                 "pero solo enfrenta a 16, así que en la práctica el número suele terminar siendo menor.")
+    if P["avisos"]:
+        chica.append("Pendiente: " + " ".join(P["avisos"]))
+    L += chica
+    return "\n\n".join(L)
+
+def lpf_tabla_zonas_texto(Z):
+    if not Z:
+        return "No hay zonas cargadas."
+    L = []
+    for lab in sorted(Z):
+        df = liga_tabla_df(Z[lab])
+        L.append(f"**Zona {lab}** (clasifican los 8 primeros)")
+        for _, r in df.iterrows():
+            ic = "🟢" if int(r["Pos"]) <= 8 else "⚪"
+            L.append(f"{ic} {int(r['Pos'])}º **{r['Equipo']}** · {int(r['PTS'])} pts (DG {int(r['DG']):+d})")
+        L.append("")
+    return "\n\n".join(L)
+
+
+# ═══ Nombres canónicos de los 30 clubes de la LPF 2026 (evita que "River" y "River Plate" sean dos equipos) ═══
+LPF_CLUBES = {
+ "Argentinos Juniors": ["argentinos", "argentinos jrs", "aa argentinos juniors"],
+ "Aldosivi": ["aldosivi"],
+ "Atlético Tucumán": ["atl tucuman", "atletico tucuman", "tucuman", "ca tucuman"],
+ "Banfield": ["banfield", "ca banfield"],
+ "Barracas Central": ["barracas", "barracas central"],
+ "Belgrano": ["belgrano", "ca belgrano"],
+ "Boca Juniors": ["boca", "boca jrs", "boca juniors", "ca boca juniors"],
+ "Central Córdoba": ["central cordoba", "central cordoba sde", "ca central cordoba"],
+ "Defensa y Justicia": ["defensa", "defensa y justicia"],
+ "Deportivo Riestra": ["riestra", "deportivo riestra"],
+ "Estudiantes de La Plata": ["estudiantes", "estudiantes lp", "estudiantes de la plata", "edlp", "estudiantes (la plata)"],
+ "Estudiantes de Río Cuarto": ["estudiantes rc", "estudiantes de rio cuarto", "estudiantes (rc)", "estudiantes rio cuarto",
+                              "estudiantes (río cuarto)", "estudiantes (rio cuarto)"],
+ "Gimnasia La Plata": ["gimnasia", "gimnasia lp", "gimnasia y esgrima la plata", "gelp",
+                      "gimnasia la plata", "gimnasia (la plata)", "gimnasia y esgrima"],
+ "Gimnasia de Mendoza": ["gimnasia m", "gimnasia (m)", "gimnasia y esgrima de mendoza", "gimnasia mendoza",
+                         "gimnasia mza", "gimnasia (mza)", "gimnasia (mza )", "gimnasia de mza", "gimnasia y esgrima mendoza"],
+ "Godoy Cruz": ["godoy cruz", "godoy"],
+ "Huracán": ["huracan", "ca huracan"],
+ "Independiente": ["independiente", "ca independiente"],
+ "Independiente Rivadavia": ["independiente riv", "independiente rivadavia", "ind rivadavia", "sportivo independiente rivadavia"],
+ "Instituto": ["instituto", "instituto atletico central cordoba"],
+ "Lanús": ["lanus", "ca lanus"],
+ "Newell's Old Boys": ["newells", "newell s old boys", "newells old boys", "noob"],
+ "Platense": ["platense", "ca platense"],
+ "Racing": ["racing", "racing club"],
+ "River Plate": ["river", "river plate", "ca river plate"],
+ "Rosario Central": ["central", "rosario central", "ca rosario central"],
+ "San Lorenzo": ["san lorenzo", "san lorenzo de almagro"],
+ "Sarmiento": ["sarmiento", "sarmiento junin"],
+ "Talleres": ["talleres", "talleres cordoba"],
+ "Tigre": ["tigre", "ca tigre"],
+ "Unión": ["union", "union santa fe"],
+ "Vélez Sarsfield": ["velez", "velez sarsfield", "ca velez sarsfield"],
+}
+def _norm_club(x):
+    t = _zlow(str(x or ""))
+    t = t.replace("'", "").replace("\u2019", "").replace(".", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+_LPF_LOOKUP = {}
+for _c, _als in LPF_CLUBES.items():
+    _LPF_LOOKUP[_norm_club(_c)] = _c
+    for _a in _als:
+        _LPF_LOOKUP[_norm_club(_a)] = _c
+
+def canon_club(nombre):
+    """Nombre canónico del club, venga de donde venga. Compara SIEMPRE el nombre completo primero,
+    para no confundir «Gimnasia (M)» con «Gimnasia» ni «Estudiantes RC» con «Estudiantes»."""
+    n = _norm_club(nombre)
+    if not n:
+        return nombre
+    if n in _LPF_LOOKUP:
+        return _LPF_LOOKUP[n]
+    # variante conservando lo que hay entre paréntesis: "Gimnasia (Mza.)" -> "gimnasia mza"
+    n_llano = _norm_club(re.sub(r"[()]", " ", str(nombre or "")))
+    if n_llano and n_llano in _LPF_LOOKUP:
+        return _LPF_LOOKUP[n_llano]
+    # recién al final probamos sin el paréntesis, y solo si no era un desambiguador
+    # sin el paréntesis: se permite salvo en los nombres que tienen "hermano" (Gimnasia, Estudiantes, etc.)
+    _AMBIGUOS = {"gimnasia", "estudiantes", "independiente", "central", "atletico tucuman"}
+    n2 = _norm_club(re.sub(r"\s*\([^)]*\)", " ", str(nombre or "")))
+    if n2 and n2 not in _AMBIGUOS and n2 in _LPF_LOOKUP:
+        return _LPF_LOOKUP[n2]
+    cands = {c for k, c in _LPF_LOOKUP.items() if (k in n or n in k) and abs(len(k) - len(n)) <= 8}
+    return cands.pop() if len(cands) == 1 else str(nombre).strip()
+
+def canon_base(base):
+    return {canon_club(e): d for e, d in (base or {}).items()}
+
+# ═══ FIXTURE Clausura 2026 (Tarea 2) — texto crudo + parser + pendientes ═══
+LPF_FIXTURE_2026 = """
+Fecha 1
+Interzonal: Defensa y Justicia – Aldosivi
+Zona A
+Deportivo Riestra – Boca
+Estudiantes – Independiente
+Newell's – Talleres
+Vélez – Instituto
+Platense – Unión
+Lanús – San Lorenzo
+Gimnasia (Mza.) – Central Córdoba
+Zona B
+River – Barracas Central
+Racing – Gimnasia
+Belgrano – Rosario Central
+Estudiantes (Río Cuarto) – Tigre
+Sarmiento – Argentinos
+Huracán – Banfield
+Atlético Tucumán – Independiente Rivadavia Mza.
+
+Fecha 2
+Interzonal: Central Córdoba – Atlético Tucumán
+Zona A
+San Lorenzo – Gimnasia (Mza.)
+Unión – Lanús
+Instituto – Platense
+Talleres – Vélez
+Independiente – Newell's
+Boca – Estudiantes
+Defensa y Justicia – Deportivo Riestra
+Zona B
+Independiente Rivadavia Mza. – Huracán
+Banfield – Sarmiento
+Argentinos – Estudiantes (Río Cuarto)
+Tigre – Belgrano
+Rosario Central – Racing
+Gimnasia – River
+Barracas Central – Aldosivi
+
+Fecha 3
+Interzonal: Deportivo Riestra – Barracas Central
+Zona A
+Estudiantes – Defensa y Justicia
+Newell's – Boca
+Vélez – Independiente
+Platense – Talleres
+Lanús – Instituto
+Gimnasia (Mza.) – Unión
+Central Córdoba – San Lorenzo
+Zona B
+Aldosivi – Gimnasia
+River – Rosario Central
+Racing – Tigre
+Belgrano – Argentinos
+Estudiantes (Río Cuarto) – Banfield
+Sarmiento – Independiente Rivadavia Mza.
+Huracán – Atlético Tucumán
+
+Fecha 4
+Interzonal: San Lorenzo – Huracán
+Zona A
+Unión – Central Córdoba
+Instituto – Gimnasia (Mza.)
+Talleres – Lanús
+Independiente – Platense
+Boca – Vélez
+Defensa y Justicia – Newell's
+Deportivo Riestra – Estudiantes
+Zona B
+Atlético Tucumán – Sarmiento
+Independiente Rivadavia (Mza.) – Estudiantes (Río Cuarto)
+Banfield – Belgrano
+Argentinos – Racing
+Tigre – River
+Rosario Central – Aldosivi
+Gimnasia – Barracas Central
+
+Fecha 5
+Interzonal: Estudiantes – Gimnasia
+Zona A
+Newell's – Deportivo Riestra
+Vélez – Defensa y Justicia
+Platense – Boca
+Lanús – Independiente
+Gimnasia (Mza.) – Talleres
+Central Córdoba – Instituto
+San Lorenzo – Unión
+Zona B
+Barracas Central – Rosario Central
+Aldosivi – Tigre
+River – Argentinos
+Racing – Banfield
+Belgrano – Independiente Rivadavia Mza.
+Estudiantes (Río Cuarto) – Atlético Tucumán
+Sarmiento – Huracán
+
+Fecha 6 (fecha interzonal completa)
+River – Vélez
+Barracas Central – Platense
+Talleres – Rosario Central
+Sarmiento – Estudiantes
+Belgrano – Defensa y Justicia
+Lanús – Argentinos
+Racing – Boca
+Independiente – Independiente Rivadavia Mza.
+Aldosivi – Unión
+Atlético Tucumán – Instituto
+Estudiantes (Río Cuarto) – San Lorenzo
+Gimnasia – Gimnasia (Mza.)
+Tigre – Central Córdoba
+Huracán – Deportivo Riestra
+Newell's – Banfield
+
+Fecha 7
+Interzonal: Unión – Sarmiento
+Zona A
+Instituto – San Lorenzo
+Talleres – Central Córdoba
+Independiente – Gimnasia (Mza.)
+Boca – Lanús
+Defensa y Justicia – Platense
+Deportivo Riestra – Vélez
+Estudiantes – Newell's
+Zona B
+Huracán – Estudiantes (Río Cuarto)
+Atlético Tucumán – Belgrano
+Independiente Rivadavia Mza. – Racing
+Banfield – River
+Argentinos – Aldosivi
+Tigre – Barracas Central
+Rosario Central – Gimnasia
+
+Fecha 8
+Interzonal: Rosario Central – Newell's
+Zona A
+Vélez – Estudiantes
+Platense – Deportivo Riestra
+Lanús – Defensa y Justicia
+Gimnasia (Mza.) – Boca
+Central Córdoba – Independiente
+San Lorenzo – Talleres
+Unión – Instituto
+Zona B
+Gimnasia – Tigre
+Barracas Central – Argentinos
+Aldosivi – Banfield
+River – Independiente Rivadavia Mza.
+Racing – Atlético Tucumán
+Belgrano – Huracán
+Estudiantes (Río Cuarto) – Sarmiento
+
+Fecha 9
+Interzonal: Instituto – Estudiantes (Río Cuarto)
+Zona A
+Talleres – Unión
+Independiente – San Lorenzo
+Boca – Central Córdoba
+Defensa y Justicia – Gimnasia (Mza.)
+Deportivo Riestra – Lanús
+Estudiantes – Platense
+Newell's – Vélez
+Zona B
+Sarmiento – Belgrano
+Huracán – Racing
+Atlético Tucumán – River
+Independiente Rivadavia Mza. – Aldosivi
+Banfield – Barracas Central
+Argentinos – Gimnasia
+Tigre – Rosario Central
+
+Fecha 10
+Interzonal: Vélez – Tigre
+Zona A
+Platense – Newell's
+Lanús – Estudiantes
+Gimnasia (Mza.) – Deportivo Riestra
+Central Córdoba – Defensa y Justicia
+San Lorenzo – Boca
+Unión – Independiente
+Instituto – Talleres
+Zona B
+Rosario Central – Argentinos
+Gimnasia – Banfield
+Barracas Central – Independiente Rivadavia Mza.
+Aldosivi – Atlético Tucumán
+River – Huracán
+Racing – Sarmiento
+Belgrano – Estudiantes (Río Cuarto)
+
+Fecha 11
+Interzonal: Talleres – Belgrano
+Zona A
+Independiente – Instituto
+Boca – Unión
+Defensa y Justicia – San Lorenzo
+Deportivo Riestra – Central Córdoba
+Estudiantes – Gimnasia (Mza.)
+Newell's – Lanús
+Vélez – Platense
+Zona B
+Estudiantes (Río Cuarto) – Racing
+Sarmiento – River
+Huracán – Aldosivi
+Atlético Tucumán – Barracas Central
+Independiente Rivadavia Mza. – Gimnasia
+Banfield – Rosario Central
+Argentinos – Tigre
+
+Fecha 12
+Interzonal: Platense – Argentinos
+Zona A
+Lanús – Vélez
+Gimnasia (Mza.) – Newell's
+Central Córdoba – Estudiantes
+San Lorenzo – Deportivo Riestra
+Unión – Defensa y Justicia
+Instituto – Boca
+Talleres – Independiente
+Zona B
+Tigre – Banfield
+Rosario Central – Independiente Rivadavia Mza.
+Gimnasia – Atlético Tucumán
+Barracas Central – Huracán
+Aldosivi – Sarmiento
+River – Estudiantes (Río Cuarto)
+Racing – Belgrano
+
+Fecha 13
+Interzonal: Racing – Independiente
+Zona A
+Boca – Talleres
+Defensa y Justicia – Instituto
+Deportivo Riestra – Unión
+Estudiantes – San Lorenzo
+Newell's – Central Córdoba
+Vélez – Gimnasia (Mza.)
+Platense – Lanús
+Zona B
+Belgrano – River
+Estudiantes (Río Cuarto) – Aldosivi
+Sarmiento – Barracas Central
+Huracán – Gimnasia
+Atlético Tucumán – Rosario Central
+Independiente Rivadavia Mza. – Tigre
+Banfield – Argentinos
+
+Fecha 14
+Interzonal: Banfield – Lanús
+Zona A
+Gimnasia (Mza.) – Platense
+Central Córdoba – Vélez
+San Lorenzo – Newell's
+Unión – Estudiantes
+Instituto – Deportivo Riestra
+Talleres – Defensa y Justicia
+Independiente – Boca
+Zona B
+Argentinos – Independiente Rivadavia Mza.
+Tigre – Atlético Tucumán
+Rosario Central – Huracán
+Gimnasia – Sarmiento
+Barracas Central – Estudiantes (Río Cuarto)
+Aldosivi – Belgrano
+River – Racing
+
+Fecha 15
+Interzonal: Boca – River
+Zona A
+Defensa y Justicia – Independiente
+Deportivo Riestra – Talleres
+Estudiantes – Instituto
+Newell's – Unión
+Vélez – San Lorenzo
+Platense – Central Córdoba
+Lanús – Gimnasia (Mza.)
+Zona B
+Racing – Aldosivi
+Belgrano – Barracas Central
+Estudiantes de Río Cuarto – Gimnasia
+Sarmiento – Rosario Central
+Huracán – Tigre
+Atlético Tucumán – Argentinos Juniors
+Independiente Rivadavia Mza. – Banfield
+
+Fecha 16
+Interzonal: Gimnasia (Mza.) – Independiente Rivadavia Mza.
+Zona A
+Central Córdoba – Lanús
+San Lorenzo – Platense
+Unión – Vélez
+Instituto – Newell's
+Talleres – Estudiantes
+Independiente – Deportivo Riestra
+Boca – Defensa y Justicia
+Zona B
+Banfield – Atlético Tucumán
+Argentinos – Huracán
+Tigre – Sarmiento
+Rosario Central – Estudiantes (Río Cuarto)
+Gimnasia – Belgrano
+Barracas Central – Racing
+Aldosivi – River
+"""
+
+_SEP = __import__("re").compile(r"\s+[–—-]\s+")
+
+def parse_fixture_lpf(text=None, canon=None):
+    if text is None: text = LPF_FIXTURE_2026
+    if canon is None: canon = canon_club
+    """Devuelve lista de dicts: {'f':fecha, 'tipo':'zona'|'inter', 'zona':'A'/'B'/None, 'l':local, 'v':visita}.
+    Canoniza ambos nombres con canon_club para que peguen con las zonas cargadas."""
+    import re
+    juegos, f, tipo, zona = [], 0, None, None
+    for raw in str(text).splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        mf = re.match(r"(?i)^fecha\s+(\d+)", ln)
+        if mf:
+            f = int(mf.group(1)); zona = None
+            tipo = "inter" if "interzonal" in ln.lower() else None
+            continue
+        low = ln.lower()
+        if low.startswith("zona a"):
+            zona, tipo = "A", "zona"; continue
+        if low.startswith("zona b"):
+            zona, tipo = "B", "zona"; continue
+        if low.startswith("interzonal"):
+            resto = ln.split(":", 1)[1] if ":" in ln else ""
+            partes = _SEP.split(resto.strip())
+            if len(partes) == 2:
+                juegos.append({"f": f, "tipo": "inter", "zona": None,
+                               "l": canon(partes[0]), "v": canon(partes[1])})
+            continue
+        partes = _SEP.split(ln)
+        if len(partes) == 2:
+            juegos.append({"f": f, "tipo": tipo or "inter", "zona": zona,
+                           "l": canon(partes[0]), "v": canon(partes[1])})
+    return juegos
+
+def lpf_pendientes(Z, games=None, canon=None):
+    """Pendientes reales desde el fixture, coherentes con el PJ de las zonas cargadas.
+    Un partido está jugado si AMBOS equipos ya llegaron a esa altura de su calendario (por PJ).
+    Devuelve lista de pares (local, visita) canónicos de los partidos por jugar."""
+    if games is None:
+        games = LPF_FIXTURE
+    pj = {}
+    for b in (Z or {}).values():
+        for e, d in b.items():
+            pj[e] = d.get("pj", 0)
+    # índice de cada partido en el calendario de cada equipo (por fecha)
+    orden = {}
+    for g in sorted(games, key=lambda x: x["f"]):
+        for e in (g["l"], g["v"]):
+            orden.setdefault(e, []).append(g)
+    idx = {}
+    for e, gs in orden.items():
+        for i, g in enumerate(gs, 1):
+            idx[(e, id(g))] = i
+    pend = []
+    for g in games:
+        il = idx[(g["l"], id(g))]; iv = idx[(g["v"], id(g))]
+        jugado = (il <= pj.get(g["l"], 0)) and (iv <= pj.get(g["v"], 0))
+        if not jugado and g["l"] in pj and g["v"] in pj:
+            pend.append((g["l"], g["v"]))
+    return pend
+
+
+def _linea_garantia(base, rest, pend, equipo, k):
+    """Piso seguro, delegado al núcleo aislado y validado por fuerza bruta.
+
+    La cota prueba todos los subconjuntos relevantes y descuenta los puntos que no
+    pueden existir cuando dos rivales se enfrentan. Puede ser conservadora, pero no
+    declara una clasificación garantizada que todavía dependa de otros resultados.
+    """
+    return safe_guarantee_line(base, rest, pend or [], equipo, k)
+
+
+# fixture parseado una sola vez (nombres canónicos), para pendientes/rest
+LPF_FIXTURE = parse_fixture_lpf()
+
+def lpf_rest_desde_fixture(Z):
+    """rest por equipo = 16 - PJ (coherente con las tablas cargadas)."""
+    return {e: max(0, LPF_FECHAS_TOTAL - d.get('pj', 0)) for b in (Z or {}).values() for e, d in b.items()}
+
+
+def parse_promedios_tabla(texto, pj_actual=None):
+    """Lee la tabla de promedios pegada (formato Promiedos: puesto / nombre / nombre /
+    Prom Pts PJ y una columna por temporada). Devuelve (previas, pj_actual, avisos).
+    «previas» = {equipo: (pts_previos, pj_previos)}, ya descontada la temporada en curso,
+    porque los puntos del 2026 los toma de las tablas cargadas."""
+    filas, cand, avisos = [], None, []
+    rx_prom = re.compile(r"^\s*(\d+[.,]\d{2,3})\b")
+    for ln in (texto or "").splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        m = rx_prom.match(t)
+        if m:
+            nums = [float(x.replace(",", ".")) for x in re.findall(r"-?\d+(?:[.,]\d+)?", t)]
+            if len(nums) >= 3 and cand:
+                prom, pts, pj = nums[0], int(nums[1]), int(nums[2])
+                temporadas = [int(x) for x in nums[3:]]
+                filas.append({"eq": cand, "prom": prom, "pts": pts, "pj": pj, "temp": temporadas})
+                cand = None
+        elif not re.fullmatch(r"\d+", t) and not _zlow(t).startswith(("promedios", "descenso", "equipos", "#")):
+            cand = t
+    if not filas:
+        return {}, None, ["No pude leer la tabla. Pegala tal cual sale de Promiedos (puesto, equipo, Prom Pts PJ y las columnas por temporada)."]
+    # PJ de la temporada en curso: los recién ascendidos solo tienen la última columna
+    if pj_actual is None:
+        solos = [f["pj"] for f in filas if f["temp"] and sum(f["temp"][:-1]) == 0]
+        pj_actual = min(solos) if solos else None
+    if pj_actual is None:
+        avisos.append("No pude deducir cuántos partidos van del 2026: uso 0 y el promedio va a quedar corrido.")
+        pj_actual = 0
+    previas = {}
+    for f in filas:
+        c_act = f["temp"][-1] if f["temp"] else 0
+        if f["temp"] and sum(f["temp"]) != f["pts"]:
+            avisos.append(f"{f['eq']}: las columnas por temporada no suman los puntos totales; lo cargo igual.")
+        previas[canon_club(f["eq"])] = (max(0, f["pts"] - c_act), max(0, f["pj"] - pj_actual))
+    return previas, pj_actual, avisos
+
+def promedios_previas_texto(previas):
+    return "\n".join(f"{e}, {p}, {j}" for e, (p, j) in previas.items())
+
+# Tabla de promedios de la LPF 2026 (previa a la fecha 2 del Clausura). Fuente: tabla pegada por el usuario.
+PROMEDIOS_LPF_2026 = """1
+Boca Jrs.
+Boca Jrs.
+1.767\t159\t90\t67\t62\t30
+2
+River
+River
+1.689\t152\t90\t70\t53\t29
+3
+Vélez
+Vélez
+1.633\t147\t90\t76\t40\t31
+4
+Racing
+Racing
+1.633\t147\t90\t70\t53\t24
+5
+Argentinos
+Argentinos
+1.611\t145\t90\t56\t57\t32
+6
+Central
+Central
+1.567\t141\t90\t47\t66\t28
+7
+Independiente
+Independiente
+1.522\t137\t90\t63\t47\t27
+8
+Estudiantes
+Estudiantes
+1.511\t136\t90\t63\t42\t31
+9
+Lanús
+Lanús
+1.511\t136\t90\t59\t50\t27
+10
+Huracán
+Huracán
+1.489\t134\t90\t62\t47\t25
+11
+Talleres
+Talleres
+1.467\t132\t90\t72\t34\t26
+12
+Independiente Riv.
+Independiente Riv.
+1.378\t124\t90\t46\t43\t35
+13
+Barracas
+Barracas
+1.356\t122\t90\t49\t49\t24
+14
+Unión
+Unión
+1.344\t121\t90\t60\t39\t22
+15
+San Lorenzo
+San Lorenzo
+1.311\t118\t90\t45\t51\t22
+16
+Gimnasia (M)
+Gimnasia (M)
+1.294\t22\t17\t0\t0\t22
+17
+Defensa
+Defensa
+1.289\t116\t90\t58\t38\t20
+18
+Belgrano
+Belgrano
+1.278\t115\t90\t49\t37\t29
+19
+Riestra
+Riestra
+1.267\t114\t90\t48\t52\t14
+20
+Gimnasia
+Gimnasia
+1.244\t112\t90\t48\t38\t26
+21
+Platense
+Platense
+1.211\t109\t90\t57\t35\t17
+22
+Instituto
+Instituto
+1.200\t108\t90\t53\t34\t21
+23
+Tigre
+Tigre
+1.200\t108\t90\t39\t49\t20
+24
+Newell's
+Newell's
+1.111\t100\t90\t49\t33\t18
+25
+Central Córdoba
+Central Córdoba
+1.111\t100\t90\t42\t42\t16
+26
+Atl. Tucumán
+Atl. Tucumán
+1.100\t99\t90\t50\t34\t15
+27
+Banfield
+Banfield
+1.044\t94\t90\t41\t35\t18
+28
+Sarmiento
+Sarmiento
+0.989\t89\t90\t35\t35\t19
+29
+Aldosivi
+Aldosivi
+0.857\t42\t49\t0\t33\t9
+30
+Estudiantes RC
+Estudiantes RC
+0.471\t8\t17\t0\t0\t8"""
+
+
+# Zonas del Clausura 2026 (fecha 2 en curso). Fuente: tablas pegadas por el usuario.
+ZONA_A_LPF_2026 = """1
+Gimnasia (M)
+4	2	1:0	1	1	1	0
+2
+Riestra
+3	1	3:0	3	1	0	0
+3
+Independiente
+3	1	2:0	2	1	0	0
+4
+Newell's
+3	1	1:0	1	1	0	0
+5
+Vélez
+3	1	1:0	1	1	0	0
+6
+Lanús
+3	1	1:0	1	1	0	0
+7
+Unión
+1	1	2:2	0	0	1	0
+8
+Platense
+1	1	2:2	0	0	1	0
+9
+Defensa
+1	1	1:1	0	0	1	0
+10
+San Lorenzo
+1	2	0:1	-1	0	1	1
+11
+Central Córdoba
+0	1	0:1	-1	0	0	1
+12
+Instituto
+0	1	0:1	-1	0	0	1
+13
+Talleres
+0	1	0:1	-1	0	0	1
+14
+Estudiantes
+0	1	0:2	-2	0	0	1
+15
+Boca Jrs.
+0	1	0:3	-3	0	0	1"""
+
+ZONA_B_LPF_2026 = """1
+Argentinos
+3	1	3:2	1	1	0	0
+2
+Belgrano
+3	1	2:1	1	1	0	0
+3
+Racing
+3	1	2:1	1	1	0	0
+4
+Huracán
+3	1	1:0	1	1	0	0
+5
+Estudiantes RC
+3	1	1:0	1	1	0	0
+6
+Barracas
+3	1	1:0	1	1	0	0
+7
+Aldosivi
+1	1	1:1	0	0	1	0
+8
+Atl. Tucumán
+1	1	0:0	0	0	1	0
+9
+Independiente Riv.
+1	1	0:0	0	0	1	0
+10
+Sarmiento
+1	2	2:3	-1	0	1	1
+11
+Banfield
+1	2	0:1	-1	0	1	1
+12
+Central
+0	1	1:2	-1	0	0	1
+13
+Gimnasia
+0	1	1:2	-1	0	0	1
+14
+River
+0	1	0:1	-1	0	0	1
+15
+Tigre
+0	1	0:1	-1	0	0	1"""
+
+LPF_FECHAS_TOTAL = 16  # fase de zonas del Clausura (art. 14.1)
+
+def parse_tabla_anual(texto):
+    """Lee la Tabla Anual pegada (formato Promiedos: puesto / nombre / nombre / PTS J Gol +/- G E P).
+    Devuelve (base, avisos) con base = {equipo: {pts, pj, dg, gf, ga}}."""
+    base, cand, avisos = {}, None, []
+    for ln in (texto or "").splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        nums = re.findall(r"-?\d+", t)
+        # fila de datos: PTS J GF GC DG G E P (el "29:15" aporta dos números)
+        if len(nums) >= 6 and re.match(r"^-?\d", t) and cand:
+            n = [int(x) for x in nums]
+            pts, pj, gf, ga, dg = n[0], n[1], n[2], n[3], n[4]
+            if len(n) >= 8:
+                g, e, p = n[5], n[6], n[7]
+                if pj != g + e + p:
+                    avisos.append(f"{cand}: G+E+P no da los partidos jugados; lo cargo igual.")
+                elif pts != 3 * g + e:
+                    avisos.append(f"{cand}: los puntos no coinciden con G/E; lo cargo igual.")
+            base[canon_club(cand)] = {"pts": pts, "pj": pj, "dg": dg, "gf": gf, "ga": ga}
+            cand = None
+        elif (not re.fullmatch(r"[\d\-:\s]+", t)
+              and not _zlow(t).startswith(("tabla", "equipos", "#", "campeon", "conmebol", "descenso",
+                                           "grupo", "zona", "octavos", "live", "vivo", "pts"))):
+            cand = t
+    if not base:
+        return {}, ["No pude leer la tabla anual. Pegala tal cual sale de Promiedos."]
+    return base, avisos
+
+def derivar_apertura(anual, Z):
+    """Apertura = Anual − lo que ya se jugó del Clausura, para que la anual siga viva
+    a medida que avanzan las fechas (y no quede congelada en la foto pegada)."""
+    clausura = {}
+    for lab, b in (Z or {}).items():
+        clausura.update(b)
+    asign = _asignar_nombres(list(anual.keys()), list(clausura.keys()))
+    out, avisos = {}, []
+    for nombre, d in anual.items():
+        e = asign.get(nombre)
+        c = clausura.get(e, {}) if e else {}
+        ap = {k: d.get(k, 0) - c.get(k, 0) for k in ("pts", "pj", "dg", "gf", "ga")}
+        if ap["pts"] < 0 or ap["pj"] < 0:
+            avisos.append(f"{nombre}: la anual pegada tiene menos que el Clausura cargado; revisá que sean de la misma fecha.")
+            ap = {k: max(0, v) for k, v in ap.items()}
+        out[e or nombre] = ap
+    pjs = sorted({d["pj"] for d in out.values()})
+    if len(pjs) > 1:
+        avisos.append(f"⚠️ El Apertura derivado da distinta cantidad de partidos según el equipo ({pjs}). "
+                      "Casi seguro pegaste la **anual y el Clausura de fechas distintas**: tienen que ser del mismo momento.")
+    elif pjs and pjs[0] != 16:
+        avisos.append(f"⚠️ El Apertura derivado da {pjs[0]} partidos y la fase de zonas del Apertura fueron 16 fechas. "
+                      "Revisá que la anual y las tablas del Clausura sean de la misma fecha.")
+    return out, avisos
+
+# Tabla Anual LPF 2026 (previa a la fecha 2 del Clausura: 17 partidos). Fuente: tabla pegada por el usuario.
+TABLA_ANUAL_LPF_2026 = """1
+Independiente Riv.
+35\t17\t29:15\t14\t10\t5\t2
+2
+Argentinos
+32\t17\t20:15\t5\t9\t5\t3
+3
+Estudiantes
+31\t17\t19:9\t10\t9\t4\t4
+4
+Vélez
+31\t17\t19:12\t7\t8\t7\t2
+5
+Boca Jrs.
+30\t17\t22:12\t10\t8\t6\t3
+6
+River
+29\t17\t22:13\t9\t9\t2\t6
+7
+Belgrano
+29\t17\t19:14\t5\t8\t5\t4
+8
+Central
+28\t17\t21:18\t3\t8\t4\t5
+9
+Independiente
+27\t17\t26:20\t6\t7\t6\t4
+10
+Lanús
+27\t17\t19:15\t4\t7\t6\t4
+11
+Talleres
+26\t17\t17:14\t3\t7\t5\t5
+12
+Gimnasia
+26\t17\t20:21\t-1\t8\t2\t7
+13
+Huracán
+25\t17\t18:13\t5\t6\t7\t4
+14
+Racing
+24\t17\t19:16\t3\t6\t6\t5
+15
+Barracas
+24\t17\t16:15\t1\t6\t6\t5
+16
+Unión
+22\t17\t26:22\t4\t5\t7\t5
+17
+San Lorenzo
+22\t17\t14:15\t-1\t5\t7\t5
+18
+Gimnasia (M)
+22\t17\t15:22\t-7\t6\t4\t7
+19
+Instituto
+21\t17\t17:18\t-1\t6\t3\t8
+20
+Tigre
+20\t17\t18:16\t2\t4\t8\t5
+21
+Defensa
+20\t17\t19:22\t-3\t4\t8\t5
+22
+Sarmiento
+19\t17\t15:23\t-8\t6\t1\t10
+23
+Banfield
+18\t17\t17:20\t-3\t5\t3\t9
+24
+Newell's
+18\t17\t16:27\t-11\t4\t6\t7
+25
+Platense
+17\t17\t12:17\t-5\t3\t8\t6
+26
+Central Córdoba
+16\t17\t11:22\t-11\t4\t4\t9
+27
+Atl. Tucumán
+15\t17\t15:20\t-5\t3\t6\t8
+28
+Riestra
+14\t17\t8:12\t-4\t2\t8\t7
+29
+Aldosivi
+9\t17\t7:20\t-13\t0\t9\t8
+30
+Estudiantes RC
+8\t17\t6:24\t-18\t2\t2\t13"""
+
+# Calendario oficial de la fase de zonas del Clausura 2026 (art. 17.1 del Reglamento LPF)
+LPF_FECHAS_CLAUSURA = ["2026-07-26", "2026-07-29", "2026-08-02", "2026-08-09", "2026-08-16",
+                       "2026-08-23", "2026-08-30", "2026-09-06", "2026-09-13", "2026-09-20",
+                       "2026-10-04", "2026-10-11", "2026-10-18", "2026-10-25", "2026-11-01",
+                       "2026-11-08"]
+
+def lpf_fecha_esperada(hoy=None):
+    """Cuántas fechas del Clausura deberían estar jugadas hoy, según el calendario del reglamento."""
+    import datetime as _dt
+    hoy = hoy or _dt.date.today()
+    n = 0
+    for d in LPF_FECHAS_CLAUSURA:
+        if _dt.datetime.strptime(d, "%Y-%m-%d").date() <= hoy:
+            n += 1
+    return n, len(LPF_FECHAS_CLAUSURA)
+
+def lpf_estado_datos(Z, hoy=None):
+    """Compara lo cargado con el calendario oficial. Devuelve (texto, esta_al_dia)."""
+    pjs = [d.get("pj", 0) for b in (Z or {}).values() for d in b.values()]
+    if not pjs:
+        return "No hay zonas cargadas.", False
+    cargadas, mx = min(pjs), max(pjs)
+    esperadas, total = lpf_fecha_esperada(hoy)
+    detalle = f"fecha **{cargadas}** de {total}" + (f" — {sum(1 for p in pjs if p > cargadas)} equipos ya jugaron {mx}: la fecha está en curso (o hay postergados)" if mx != cargadas else "")
+    import datetime as _dt
+    hoyd = hoy or _dt.date.today()
+    en_juego = None
+    for i, d in enumerate(LPF_FECHAS_CLAUSURA, 1):
+        fd = _dt.datetime.strptime(d, "%Y-%m-%d").date()
+        if 0 <= (fd - hoyd).days <= 2 and i > cargadas:
+            en_juego = i; break
+    if cargadas >= esperadas:
+        base_ok = f"✅ Datos al día: tenés cargada la {detalle}."
+        if en_juego:
+            return (base_ok + f"\n\n🔴 **La fecha {en_juego} se está jugando en estos días.** "
+                    "Los partidos en curso todavía no están (o están con resultado parcial): "
+                    "actualizá las zonas cuando termine la fecha.", False)
+        return base_ok, True
+    faltan = esperadas - cargadas
+    return (f"⚠️ **Datos desactualizados**: tenés la {detalle}, pero según el calendario oficial "
+            f"ya se jugaron **{esperadas}**. Te faltan **{faltan}** fecha(s) por cargar — los resultados "
+            f"que no cargues **no se toman**, y las cuentas de playoffs, descenso y copas van a salir viejas."), False
+
+def lpf_jornada_de_dia(dia):
+    """Convierte la fecha de un partido en el número de jornada, con el calendario del reglamento."""
+    import datetime as _dt
+    try:
+        d = _dt.datetime.strptime(str(dia)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+    mejor, dif = None, 99
+    for i, f in enumerate(LPF_FECHAS_CLAUSURA, 1):
+        fd = _dt.datetime.strptime(f, "%Y-%m-%d").date()
+        dd = abs((d - fd).days)
+        if dd < dif:
+            mejor, dif = i, dd
+    return mejor if dif <= 5 else None
+
+def _etiq(a, b):
+    d = (globals().get("_ESPN_DIA") or {}).get((a, b))
+    j = lpf_jornada_de_dia(d) if d else None
+    return f" _(f{j})_" if j else ""
+
+def lpf_estado_fecha_texto(Z, liga="arg.1", con_vivo=True):
+    """Qué está tomado y qué no: por PJ de cada equipo, más los partidos de hoy según ESPN."""
+    pjs = [d.get("pj", 0) for b in (Z or {}).values() for d in b.values()]
+    if not pjs:
+        return "No hay zonas cargadas."
+    mn, mx = min(pjs), max(pjs)
+    L = [f"**¿Qué tiene cargado la app?** (sale de los partidos jugados de cada equipo)"]
+    if mn == mx:
+        L.append(f"Todos los equipos tienen **{mx} partidos**: la fecha {mx} está completa y tomada. ✅")
+    else:
+        L.append(f"La fecha **{mx}** está a medias: unos equipos van {mx} y otros {mn}.")
+        for lab in sorted(Z):
+            ya = sorted([e for e, d in Z[lab].items() if d.get("pj", 0) >= mx])
+            no = sorted([e for e, d in Z[lab].items() if d.get("pj", 0) < mx])
+            L.append(f"**Zona {lab} — ya jugaron y están tomados ({len(ya)}):** " + (", ".join(ya) or "—"))
+            L.append(f"**Zona {lab} — todavía NO ({len(no)}):** " + (", ".join(no) or "—"))
+        L.append("_Los que todavía no jugaron no suman nada en las cuentas: cuando terminen, recargá las zonas._")
+    if con_vivo:
+        try:
+            jg, pen, _n, err = espn_fixture(liga, dias=3)
+            if not err:
+                if jg:
+                    porf = {}
+                    for a, b, x, y in jg:
+                        porf.setdefault(_etiq(a, b) or " _(s/f)_", []).append(f"{canon_club(a)} {x}-{y} {canon_club(b)}")
+                    L.append("**Terminados (según ESPN):**")
+                    for et, lst in sorted(porf.items()):
+                        L.append(f"· **Fecha{et.replace(' _(f','').replace(')_','').replace(' _(s/f)_','?')}**: " + ", ".join(lst))
+                if pen:
+                    porf2 = {}
+                    for a, b in pen:
+                        porf2.setdefault(_etiq(a, b) or " _(s/f)_", []).append(f"{canon_club(a)} vs {canon_club(b)}")
+                    L.append("**Por jugarse / en curso (según ESPN):**")
+                    for et, lst in sorted(porf2.items()):
+                        L.append(f"· **Fecha{et.replace(' _(f','').replace(')_','').replace(' _(s/f)_','?')}**: " + ", ".join(lst))
+                L.append("_Esto último sale en vivo de ESPN y es solo informativo: la app calcula con las tablas cargadas, "
+                         "no con estos partidos._")
+        except Exception:
+            pass
+    return "\n\n".join(L)
+
+def lpf_relato_zona_texto(Z, lab, rest, hoy_fecha=None):
+    """Narración de una zona, armada con los números del motor (sin LLM: no puede inventar)."""
+    base = (Z or {}).get(lab)
+    if not base:
+        return f"No tengo cargada la Zona {lab}."
+    df = liga_tabla_df(base); orden = list(df["Equipo"])
+    pts = {e: base[e]["pts"] for e in base}
+    n = len(orden); k = 8
+    lider = orden[0]; octavo = orden[k-1] if n >= k else orden[-1]
+    noveno = orden[k] if n > k else None
+    gx = {e: rest.get(e, 0) for e in base}
+    jugadas = max((d.get("pj", 0) for d in base.values()), default=0)
+    P = [f"**Zona {lab} — cómo viene** (fecha {jugadas} de {LPF_FECHAS_TOTAL})"]
+    P.append(f"Manda **{lider}** con {pts[lider]} puntos. La zona de clasificación se corta en el 8º, "
+             f"hoy **{octavo}** con {pts[octavo]}" +
+             (f", y el primero que queda afuera es **{noveno}** con {pts[noveno]}." if noveno else "."))
+    if noveno and pts[octavo] == pts[noveno]:
+        P.append(f"Están igualados en puntos: hoy entra {octavo} por diferencia de gol (art. 16 a).")
+    # ya clasificados / eliminados exactos
+    dentro = [e for e in orden if _liga_in_out(e, base, rest, k) == "in"]
+    fuera = [e for e in orden if _liga_in_out(e, base, rest, k) == "out"]
+    if dentro:
+        P.append(f"**Ya tienen los playoffs asegurados:** {', '.join(dentro)}.")
+    if fuera:
+        P.append(f"**Ya no llegan:** {', '.join(fuera)}.")
+    if not dentro and not fuera:
+        P.append("Con lo que falta, **todos siguen con chances matemáticas** de entrar entre los 8.")
+    # pelea abierta: cuántos están a menos de una victoria del corte
+    if noveno:
+        cerca = [e for e in orden[k:] if pts[octavo] - pts[e] <= 3 and gx.get(e, 0) > 0]
+        if cerca:
+            P.append(f"A una victoria del corte o menos: {', '.join(cerca[:6])}" +
+                     (f" y {len(cerca)-6} más" if len(cerca) > 6 else "") + ".")
+    piso, techo = pts[orden[-1]], pts[lider] + 3 * gx.get(lider, 0)
+    P.append(f"Quedan **{max(gx.values()) if gx else 0} fechas** por delante: el líder puede llegar a {techo} "
+             f"y el último de la zona todavía tiene {pts[orden[-1]] + 3*gx.get(orden[-1],0)} de techo.")
+    P.append("_Escrito con los números de la tabla cargada: no estima ni pronostica._")
+    return "\n\n".join(P)
+
+def panorama(equipos, jugados, esc, directo=None):
+    d = DIRECTO() if directo is None else directo; hay3 = MEJORES_TERCEROS() > 0
+    filas = []
+    for e in equipos:
+        s = situacion(e, esc, d)
+        if s["ya_directo"]: est = "🟢 Clasificado directo"
+        elif s["eliminado"]: est = "🔴 Eliminado"
+        elif s["puede_directo"]: est = "🟡 En disputa"
+        elif hay3: est = "🔵 Chance vía mejor 3º"
+        else: est = "🔴 Eliminado"
+        filas.append({"Equipo": e, "Estado": est, "Mejor": s["mejor"], "Peor": s["peor"],
+                      "Puede 1º": "sí" if s["puede_1"] else "no",
+                      "Directo en": f"{s['ndir']}/{s['total']}"})
+    orden = {r["Equipo"]: r["Pos"] for _, r in tabla(equipos, jugados).iterrows()}
+    return pd.DataFrame(filas).sort_values("Equipo", key=lambda c: c.map(orden)).reset_index(drop=True)
+
+def _desc_obj(o):
+    return {"exacto": f"exactamente {o[1]}º", "al_menos": f"{o[1]}º o mejor",
+            "como_mucho": f"{o[1]}º o peor", "entre": f"entre {o[1]}º y {o[-1]}º"}[o[0]]
+
+def _ok_pos(pos, o):
+    if o[0] == "exacto":    return pos == o[1]
+    if o[0] == "al_menos":  return pos <= o[1]
+    if o[0] == "como_mucho":return pos >= o[1]
+    return (pos >= o[1]) & (pos <= o[2])
+
+def resultados_para_puesto_texto(equipo, esc, pend, objetivo):
+    pos = esc[f"Pos {equipo}"]; ok = _ok_pos(pos, objetivo); desc = _desc_obj(objetivo)
+    n, tot = int(ok.sum()), len(esc)
+    if n == 0:
+        alc = ", ".join(f"{int(p)}º" for p in sorted(pos.unique()))
+        return f"❌ **IMPOSIBLE**: {equipo} no puede terminar {desc}.\n\nPuestos alcanzables: {alc}."
+    if n == tot:
+        return f"✅ {equipo} termina {desc} **pase lo que pase**."
+    df = esc.copy(); df["_c"] = df.apply(lambda r: _combo(r, pend), axis=1); df["_ok"] = ok.values
+    siempre, aveces = [], []
+    for c, g in df.groupby("_c"):
+        k, m = int(g["_ok"].sum()), len(g)
+        if k == m: siempre.append(c)
+        elif k > 0: aveces.append((c, k, m))
+    lineas = []
+    if siempre:
+        lineas.append("**Lo logra SIEMPRE con:**")
+        for c in siempre: lineas.append(f"✅ {c}")
+    if aveces:
+        lineas.append("\n**Lo logra SOLO si la dif. de gol acompaña:**")
+        for c, k, m in sorted(aveces, key=lambda x: -x[1]/x[2]):
+            lineas.append(f"⚠️ {c} &nbsp;({k}/{m} marcadores)")
+    return "\n\n".join(lineas)
+
+def probabilidades(equipos, jugados, pendientes, n=8000, media=1.3, fuerza=None, seed=1):
+    rng = np.random.default_rng(seed)
+    lam = {e: media * (fuerza.get(e, 1.0) if fuerza else 1.0) for e in equipos}
+    cuenta = {e: np.zeros(len(equipos) + 1, dtype=int) for e in equipos}
+    base = list(jugados)
+    for _ in range(n):
+        part = base + [(l, v, int(rng.poisson(lam[l] * 1.12)), int(rng.poisson(lam[v] * 0.92))) for (l, v) in pendientes]
+        for e, p in posiciones(equipos, part).items(): cuenta[e][p] += 1
+    rows = [{"Equipo": e, "1º %": round(100 * cuenta[e][1] / n, 1),
+             "Top 2 %": round(100 * cuenta[e][1:3].sum() / n, 1),
+             "Top 3 %": round(100 * cuenta[e][1:4].sum() / n, 1)} for e in equipos]
+    return pd.DataFrame(rows).sort_values("Top 2 %", ascending=False).reset_index(drop=True)
+
+def que_pasa_si(esc, pend, condiciones, equipos):
+    mask = pd.Series(True, index=esc.index)
+    for i, cond in enumerate(condiciones, 1):
+        if not cond: continue
+        gl, gv = esc[f"P{i}_gl"], esc[f"P{i}_gv"]
+        mask &= (gl > gv) if cond == "L" else (gl == gv) if cond == "E" else (gl < gv)
+    sub = esc[mask]
+    rows = [{"Equipo": e, "Mejor": int(sub[f"Pos {e}"].min()), "Peor": int(sub[f"Pos {e}"].max()),
+             "Directo posible": "sí" if (sub[f"Pos {e}"] <= 2).any() else "no",
+             "Directo seguro": "sí" if (sub[f"Pos {e}"] <= 2).all() else "no"} for e in equipos]
+    return sub, pd.DataFrame(rows)
+
+def distribucion(equipos, esc):
+    d = pd.DataFrame({e: esc[f"Pos {e}"].value_counts() for e in equipos}).fillna(0).astype(int).sort_index()
+    d.index.name = "Puesto"; return d
+
+def _restantes(equipos, pend):
+    r = {e: 0 for e in equipos}
+    for l, v in pend: r[l] += 1; r[v] += 1
+    return r
+
+def maximos_minimos(equipos, jugados, pend):
+    ov = _stats(equipos, jugados); rest = _restantes(equipos, pend)
+    rows = [{"Equipo": e, "PJ": ov[e]["pj"], "PTS": ov[e]["pts"], "Restan": rest[e],
+             "PTS máx": ov[e]["pts"] + 3 * rest[e]} for e in equipos]
+    return pd.DataFrame(rows).sort_values(["PTS", "PTS máx"], ascending=False).reset_index(drop=True)
+
+def clasificado_eliminado(equipos, jugados, pend, n=1):
+    ov = _stats(equipos, jugados); rest = _restantes(equipos, pend)
+    pts = {e: ov[e]["pts"] for e in equipos}; pmax = {e: pts[e] + 3 * rest[e] for e in equipos}
+    col = CAMPEON().capitalize() if n == 1 else f"Top {n}"
+    rows = []
+    for e in equipos:
+        arriba = sum(1 for x in equipos if x != e and pmax[x] > pts[e])
+        inalc  = sum(1 for x in equipos if x != e and pts[x] > pmax[e])
+        estado = "🟢 asegurado" if arriba < n else ("🔴 sin chances" if inalc >= n else "🟡 depende")
+        rows.append({"Equipo": e, "PTS": pts[e], "PTS máx": pmax[e], col: estado})
+    return pd.DataFrame(rows).sort_values("PTS", ascending=False).reset_index(drop=True)
+
+def numero_magico_texto(equipo, equipos, jugados, pend, n=1):
+    ov = _stats(equipos, jugados); rest = _restantes(equipos, pend)
+    pts = {e: ov[e]["pts"] for e in equipos}; pmax = {e: pts[e] + 3 * rest[e] for e in equipos}
+    otros = sorted((pmax[x] for x in equipos if x != equipo), reverse=True)
+    meta = f"ser {CAMPEON()}" if n == 1 else f"entrar al top {n}"
+    lineas = [f"**{equipo}** — para {meta}:",
+              f"Tiene **{pts[equipo]} pts** y le quedan {rest[equipo]} partidos ({3*rest[equipo]} en juego)."]
+    if len(otros) < n:
+        lineas.append(f"✅ Ya está en el top {n}.")
+    else:
+        necesita = max(0, (otros[n-1] + 1) - pts[equipo]); tope = 3 * rest[equipo]
+        if necesita == 0:
+            lineas.append("✅ Ya está asegurado pase lo que pase.")
+        elif necesita <= tope:
+            lineas.append(f"Necesita sumar **{necesita} pts** más para asegurarlo sin depender de nadie.")
+        else:
+            lineas.append(f"No puede asegurarlo solo: necesitaría {necesita} y solo hay {tope} en juego → depende de que los rivales pinchen.")
+    pq = _porque_numero_magico(equipo, equipos, jugados, pend, n)
+    if pq:
+        lineas.append("🔍 **Por qué:** " + pq)
+    return "\n\n".join(lineas)
+
+def mejor_resultado_texto(equipo, esc, pend, directo=None):
+    d = DIRECTO() if directo is None else directo
+    df = esc.copy(); df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+    rk = lambda p: 0 if p.startswith("le gana") else (1 if p.startswith("empata") else 2)
+    opciones = []
+    for prop, g in df.groupby("_p"):
+        gp = esc.loc[g.index, f"Pos {equipo}"]
+        opciones.append({"r": prop, "peor": int(gp.max()), "mejor": int(gp.min()),
+                         "prom": float(gp.mean()), "uno": int((gp == 1).sum()),
+                         "dir": int((gp <= d).sum()), "n": len(g), "rk": rk(prop)})
+    opciones.sort(key=lambda o: (round(o["prom"], 6), o["peor"], o["mejor"], o["rk"]))
+    lineas = []
+    for i, o in enumerate(opciones):
+        flag = " 👍 lo que más le conviene" if i == 0 else ""
+        lineas.append(f"• Si {equipo} **{o['r']}**: termina entre {o['mejor']}º y {o['peor']}º · "
+                      f"sale 1º en {o['uno']}/{o['n']} · clasifica directo en {o['dir']}/{o['n']}{flag}")
+    return "\n\n".join(lineas)
+
+def _gana_todo(p): return bool(p) and all(s.startswith("le gana") for s in p.split(" y "))
+
+def conviene_otros_texto(equipo, esc, pend, directo=None):
+    """Qué le conviene al equipo en los partidos que NO juega."""
+    d = DIRECTO() if directo is None else directo
+    otros_pend = [p for p in pend if equipo not in p]
+    if not otros_pend:
+        return ""
+    df = esc.copy()
+    df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+    df["_o"] = df.apply(lambda r: _res_otros(r, equipo, pend), axis=1)
+    if _pd_de(equipo, pend):
+        sub = df[df["_p"].map(_gana_todo)]
+        cab = f"Si **{equipo} gana lo suyo**, le conviene en los otros partidos (de mejor a peor):"
+        if sub.empty: sub, cab = df, f"A **{equipo}** le conviene en los otros partidos (de mejor a peor):"
+    else:
+        sub, cab = df, f"A **{equipo}** le conviene en los otros partidos (de mejor a peor):"
+    rows = []
+    for o, g in sub.groupby("_o"):
+        gp = esc.loc[g.index, f"Pos {equipo}"]
+        rows.append({"o": o, "prom": float(gp.mean()), "uno": int((gp == 1).sum()),
+                     "dir": int((gp <= d).sum()), "n": len(g)})
+    rows.sort(key=lambda r: (round(r["prom"], 6), -r["dir"] / r["n"]))
+    lineas = [cab]
+    for i, r in enumerate(rows):
+        flag = " 👍" if i == 0 else ""
+        lineas.append(f"• Que {r['o']}: sale 1º en {r['uno']}/{r['n']} · clasifica directo en {r['dir']}/{r['n']}{flag}")
+    return "\n\n".join(lineas)
+
+def combo_ideal_texto(equipo, esc, pend, directo=None):
+    """Cierra el 'conviene' con el combo ideal: lo propio + lo de los otros en una frase."""
+    d = DIRECTO() if directo is None else directo
+    if not pend:
+        return ""
+    pos = esc[f"Pos {equipo}"]; best = int(pos.min())
+    mios = _pd_de(equipo, pend)
+    df = esc.copy(); df["_p"] = df.apply(lambda r: _res_propio(r, equipo, pend), axis=1)
+    verd = "sale 1º" if best == 1 else (f"clasifica (termina {best}º)" if best <= d else f"termina {best}º")
+    # ¿algún resultado propio garantiza el mejor puesto sin depender de nadie?
+    solo = None
+    if mios:
+        for prop, g in df.groupby("_p"):
+            gp = esc.loc[g.index, f"Pos {equipo}"]
+            if int(gp.max()) == best:
+                if solo is None or prop.startswith("le gana"):
+                    solo = prop
+    if solo:
+        return f"🎯 **Escenario ideal de {equipo}:** que **{solo}** — con eso {verd} sin depender de nadie."
+    # combinar: elegir el mejor resultado propio (preferir ganar) y, dentro, un combo de otros que logre 'best'
+    cand = []
+    for prop, g in df.groupby("_p"):
+        gp = esc.loc[g.index, f"Pos {equipo}"]
+        cand.append((int(gp.min()), 0 if prop.startswith("le gana") else (1 if prop.startswith("empata") else 2), prop, g.index))
+    cand.sort()
+    _, _, prop_best, idx = cand[0]
+    sub = esc.loc[idx]
+    sub = sub[sub[f"Pos {equipo}"] == best]
+    if len(sub) == 0:
+        return ""
+    row = esc.loc[sub.index[0]]
+    otros = _res_otros(row, equipo, pend)
+    if mios and otros and otros != "(no hay otros partidos)":
+        return f"🎯 **Escenario ideal de {equipo}:** que **{prop_best}** y que en los otros **{otros}** → así {verd}."
+    if mios:
+        return f"🎯 **Escenario ideal de {equipo}:** que **{prop_best}** → así {verd}."
+    return f"🎯 **Escenario ideal de {equipo}:** que en los otros partidos **{_combo(row, pend)}** → así {verd}."
+
+def _efecto_eq(team, sub, d, hay3):
+    pos = sub[f"Pos {team}"]; rd = float((pos <= d).mean())
+    if rd >= 0.999:
+        return "termina 1º" if float((pos == 1).mean()) >= 0.999 else "clasifica"
+    if rd <= 0.001:
+        if hay3 and float((pos == 3).mean()) > 0:
+            return "queda a pelear el 3º"
+        return "queda afuera"
+    return "queda a depender"
+
+def _match_define(a, b, esc, i, d, hay3):
+    teams = []
+    for t in (a, b):
+        efs = set()
+        for res in ("L", "E", "V"):
+            sub = filtrar_esc(esc, {i: res})
+            if len(sub):
+                efs.add(_efecto_eq(t, sub, d, hay3))
+        if len(efs) > 1:
+            teams.append(t)
+    return teams
+
+def previa_fecha_texto(eqs, jug, esc, pend):
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    if not pend:
+        return "No quedan partidos: el grupo ya está definido."
+    sc = bisagra_scores(eqs, jug, pend, esc)
+    L = ["**Previa de la fecha — qué se define en cada partido:**"]
+    for s in sc:
+        a, b = s["match"]; afect = _match_define(a, b, esc, s["i"], d, hay3)
+        head = ("define la clasificación de " + ", ".join(afect)) if afect else "incide solo en el desempate"
+        L.append(f"\n**{a} vs {b}** — {head}.")
+        for res, lbl in [("L", f"Gana {a}"), ("E", "Empate"), ("V", f"Gana {b}")]:
+            sub = filtrar_esc(esc, {s["i"]: res})
+            if len(sub) == 0:
+                continue
+            L.append(f"- {lbl}: {a} {_efecto_eq(a, sub, d, hay3)}; {b} {_efecto_eq(b, sub, d, hay3)}.")
+    return "\n\n".join(L)
+
+def placa_previa_fecha_png(eqs, jug, esc, pend, etiqueta=""):
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+    from io import BytesIO
+    d = DIRECTO(); hay3 = MEJORES_TERCEROS() > 0
+    sc = bisagra_scores(eqs, jug, pend, esc)
+    if not sc:
+        return None
+    nblocks = len(sc); rows = nblocks * 4
+    fig, ax = plt.subplots(figsize=(8.4, 0.52 * rows + 1.2), dpi=200)
+    ax.set_xlim(0, 12); ax.set_ylim(0, rows); ax.axis("off")
+    titulo = "Previa de la fecha: ¿qué define cada partido?" + (f"  ·  Grupo {etiqueta}" if etiqueta else "")
+    ax.set_title(titulo, fontsize=14.5, fontweight="bold", color="#1a1a2e", loc="left", pad=12)
+    y = rows
+    colmap = {"L": "#1b5e20", "E": "#9e9e9e", "V": "#1b5e20"}
+    import textwrap
+    for s in sc:
+        a, b = s["match"]; afect = _match_define(a, b, esc, s["i"], d, hay3)
+        head = ("Define la clasificación de " + ", ".join(afect)) if afect else "Incide solo en el desempate"
+        y -= 1
+        ax.add_patch(FancyBboxPatch((0.1, y + 0.08), 11.8, 0.86, boxstyle="round,pad=0.02,rounding_size=0.08",
+                                    facecolor="#1a1a2e", edgecolor="none"))
+        ax.text(0.35, y + 0.62, f"{a} vs {b}", ha="left", va="center", color="white", fontsize=11.5, fontweight="bold")
+        ax.text(0.35, y + 0.27, head, ha="left", va="center", color="#cfe3cf", fontsize=9, style="italic")
+        for res, lbl in [("L", f"Gana {a}"), ("E", "Empate"), ("V", f"Gana {b}")]:
+            sub = filtrar_esc(esc, {s["i"]: res}); y -= 1
+            if len(sub) == 0:
+                continue
+            ax.add_patch(FancyBboxPatch((0.3, y + 0.1), 3.3, 0.78, boxstyle="round,pad=0.02,rounding_size=0.08",
+                                        facecolor=colmap[res], edgecolor="none"))
+            lbl_w = "\n".join(textwrap.wrap(lbl, 16))
+            fs = 10.5 if len(lbl) <= 14 else 9
+            ax.text(1.95, y + 0.5, lbl_w, ha="center", va="center", color="white", fontsize=fs, fontweight="bold")
+            ax.text(3.85, y + 0.5, f"{a} {_efecto_eq(a, sub, d, hay3)}  ·  {b} {_efecto_eq(b, sub, d, hay3)}",
+                    ha="left", va="center", color="#1a1a2e", fontsize=10.5)
+    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.25); plt.close(fig)
+    return buf.getvalue()
+
+def _frase_equipo(equipo, eqs, jug, esc, pend):
+    s = situacion(equipo, esc); hay3 = MEJORES_TERCEROS() > 0
+    if s["ya_directo"]:
+        if s.get("ya_1"): return "ya está 1º y clasificado."
+        if s.get("puede_1"): return "ya clasificado; todavía pelea el 1º."
+        return "ya clasificado."
+    if s["eliminado"]:
+        return "ya sin chances."
+    br = arbol_branches(equipo, eqs, jug, esc, pend)
+    if not br:
+        cat, manos = en_sus_manos(equipo, esc, pend)
+        return manos + "."
+    vd = {}
+    for b in br:
+        lab = b["label"].lower()
+        if lab.startswith("le gana"): vd["G"] = b["verd"]
+        elif lab.startswith("empata"): vd["E"] = b["verd"]
+        elif lab.startswith("pierde"): vd["P"] = b["verd"]
+    G, E, P = vd.get("G"), vd.get("E"), vd.get("P")
+    if E == "Clasifica":
+        if G == "Clasifica" and s.get("puede_1"):
+            return "con un empate ya pasa; ganando puede ser 1º."
+        return "le alcanza con un empate."
+    if G == "Clasifica":
+        if E == "Depende":
+            return "gana y pasa; si empata, queda a depender de otros."
+        if "Pelea 3º" in (E, P):
+            return "gana y pasa; si no, a esperar como mejor 3º."
+        return "tiene que ganar para clasificar."
+    if G == "Depende":
+        return "ni ganando se asegura: necesita ganar y que lo ayuden."
+    if G == "Pelea 3º":
+        return "fuera de los 2 primeros; se juega la chance de mejor 3º."
+    return "complicado: necesita ganar y esperar resultados."
+
+def que_se_juega_texto(eqs, jug, esc, pend):
+    t = tabla(eqs, jug)
+    L = ["**Qué se juega cada equipo:**"]
+    for _, r in t.iterrows():
+        e = r["Equipo"]
+        L.append(f"**{e}** ({int(r['PTS'])} pts): {_frase_equipo(e, eqs, jug, esc, pend)}")
+    return "\n\n".join(L)
+
+def placa_que_se_juega_png(eqs, jug, esc, pend, etiqueta=""):
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+    import textwrap
+    from io import BytesIO
+    t = tabla(eqs, jug); filas = list(t["Equipo"])
+    n = len(filas); fig, ax = plt.subplots(figsize=(8.2, 0.95 * n + 1.2), dpi=200)
+    ax.set_xlim(0, 12); ax.set_ylim(0, n); ax.axis("off")
+    titulo = "¿Qué se juega cada equipo?" + (f"  ·  Grupo {etiqueta}" if etiqueta else "")
+    ax.set_title(titulo, fontsize=15.5, fontweight="bold", color="#1a1a2e", loc="left", pad=12)
+    for j, e in enumerate(filas):
+        y = n - 0.5 - j
+        s = situacion(e, esc)
+        col = "#1b5e20" if s["ya_directo"] else ("#b71c1c" if s["eliminado"] else "#37474f")
+        ax.add_patch(FancyBboxPatch((0.1, y - 0.38), 3.0, 0.76, boxstyle="round,pad=0.02,rounding_size=0.1",
+                                    facecolor=col, edgecolor="none"))
+        ax.text(1.6, y, e, ha="center", va="center", color="white", fontsize=11.5, fontweight="bold")
+        frase = _frase_equipo(e, eqs, jug, esc, pend)
+        ax.text(3.35, y, "\n".join(textwrap.wrap(frase, 52)), ha="left", va="center", fontsize=11, color="#1a1a2e")
+    fig.text(0.01, -0.015, "Verde = ya clasificado · Rojo = sin chances · Gris = en juego.", fontsize=8.5, style="italic", color="#666")
+    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.25); plt.close(fig)
+    return buf.getvalue()
+
+def resumen_grupo_texto(equipos, jugados, esc=None, pend=None, directo=None):
+    """Pantallazo en texto del grupo: líder, escoltas y estado de la pelea."""
+    d = DIRECTO() if directo is None else directo
+    t = tabla(equipos, jugados); top = t.iloc[0]
+    txt = f"📋 **{top['Equipo']}** lidera con **{int(top['PTS'])} pts**"
+    if len(t) > 1: txt += f", escolta {t.iloc[1]['Equipo']} ({int(t.iloc[1]['PTS'])})."
+    else: txt += "."
+    partes = [txt]
+    if pend: partes.append("Falta(n): " + ", ".join(f"{l} vs {v}" for l, v in pend) + ".")
+    if esc is not None:
+        S = {e: situacion(e, esc, d) for e in equipos}
+        clas = [e for e in equipos if S[e]["ya_directo"]]
+        elim = [e for e in equipos if S[e]["eliminado"]]
+        disp = [e for e in equipos if not S[e]["ya_directo"] and not S[e]["eliminado"]]
+        if clas: partes.append("Ya clasificó: " + ", ".join(clas) + ".")
+        if elim: partes.append("Sin chances: " + ", ".join(elim) + ".")
+        pelean = [e for e in disp if S[e]["puede_directo"]]
+        if len(pelean) >= 2 and len(clas) < d:
+            partes.append(f"Pelean por entrar: {', '.join(pelean)}.")
+        elif disp:
+            partes.append("En disputa: " + ", ".join(disp) + ".")
+    return " ".join(partes)
+
+def necesita_por_resultados_texto(equipo, equipos, jugados, pendientes, n=None):
+    """Para muchos partidos: razona por resultado (G/E/P) y puntos, sin simular goles."""
+    n = DIRECTO() if n is None else n
+    if not pendientes:
+        return "No quedan partidos."
+    base = {e: _stats(equipos, jugados)[e]["pts"] for e in equipos}
+    mios  = [i for i, p in enumerate(pendientes) if equipo in p]
+    otros = [i for i in range(len(pendientes)) if i not in mios]
+    meta     = f"ser {CAMPEON()}" if n == 1 else f"clasificar (top {n})"
+    verbo_ok = f"es {CAMPEON()}"  if n == 1 else f"entra al top {n}"
+    porpts = {}
+    for own in product("LEV", repeat=len(mios)):
+        add = {e: 0 for e in equipos}
+        for k, i in enumerate(mios):
+            l, v = pendientes[i]
+            if own[k] == "L": add[l] += 3
+            elif own[k] == "V": add[v] += 3
+            else: add[l] += 1; add[v] += 1
+        for oth in product("LEV", repeat=len(otros)):
+            final = {e: base[e] + add[e] for e in equipos}
+            for k, i in enumerate(otros):
+                l, v = pendientes[i]
+                if oth[k] == "L": final[l] += 3
+                elif oth[k] == "V": final[v] += 3
+                else: final[l] += 1; final[v] += 1
+            p = final[equipo]
+            arriba = sum(1 for x in equipos if x != equipo and final[x] > p)
+            igual  = sum(1 for x in equipos if x != equipo and final[x] == p)
+            rem    = n - arriba
+            porpts.setdefault(p, []).append("safe" if rem >= igual + 1 else ("out" if rem <= 0 else "tie"))
+    niveles  = sorted(porpts, reverse=True)
+    safe_pts = [p for p in niveles if all(s == "safe" for s in porpts[p])]
+    out_pts  = [p for p in niveles if all(s == "out"  for s in porpts[p])]
+    medio    = [p for p in niveles if p not in safe_pts and p not in out_pts]
+    total_comb = 3 ** len(pendientes)
+    lineas = [f"**¿Qué necesita {equipo} para {meta}?** — por resultados ({total_comb:,} combinaciones)\n"]
+    if safe_pts:
+        lineas.append(f"✅ Con **{min(safe_pts)} pts** o más: {equipo} {verbo_ok} **pase lo que pase**.")
+    if medio:
+        borde = any("tie" in porpts[p] for p in medio)
+        rng = f"{min(medio)} a {max(medio)}" if min(medio) != max(medio) else f"{medio[0]}"
+        lineas.append(f"⚠️ Con **{rng} pts**: depende de los otros resultados" +
+                      (" (y en algunos casos de la diferencia de gol)" if borde else "") + ".")
+    if out_pts:
+        lineas.append(f"❌ Con **{max(out_pts)} pts** o menos: no le alcanza.")
+    lineas.append("\n_(Se razona por resultados; los empates de puntos por el último cupo se deciden por diferencia de gol.)_")
+    return "\n\n".join(lineas)
+
+# ─── TORNEO COMPLETO ─────────────────────────────────────────────────────────────
+def analizar_torneo(texto):
+    d = DIRECTO(); tablas, terceros, directos, avisos = {}, [], [], []
+    for lab, txt in dividir_grupos(texto).items():
+        eq, jug, pen = parsear_resultados(txt)
+        if len(eq) < 3: avisos.append(f"Grupo {lab}: pocos equipos."); continue
+        t = tabla(eq, jug); tablas[lab] = t
+        if pen: avisos.append(f"Grupo {lab}: faltan {len(pen)} partido(s) → terceros provisorios.")
+        for _, r in t.iterrows():
+            if r["Pos"] <= d: directos.append((lab, r["Equipo"], int(r["Pos"])))
+            if r["Pos"] == 3: terceros.append((f"{lab} · {r['Equipo']}", int(r["PTS"]), int(r["DG"]), int(r["GF"])))
+    def clave(t): return (t[1], t[2], t[3])
+    tbl3 = (pd.DataFrame([{"Pos": i, "Grupo": t[0], "PTS": t[1], "DG": t[2], "GF": t[3],
+                            "Clasifica": "✅ sí" if i <= MEJORES_TERCEROS() else "❌ no"}
+                           for i, t in enumerate(sorted(terceros, key=clave, reverse=True), 1)])
+            if terceros and MEJORES_TERCEROS() > 0 else None)
+    return tablas, directos, tbl3, avisos
+
+# ─── PARSER ─────────────────────────────────────────────────────────────────────
+_MESES = r"(ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic|jan|apr|aug|dec)"
+_DIAS  = r"(lun|mar|mié|mie|jue|vie|sáb|sab|dom|mon|tue|wed|thu|fri|sat|sun)"
+_RE_SCORE = re.compile(r"^(.+?)\s+(\d{1,2})\s*(?:[-–—xX]\s*(\d{1,2})|:\s*(\d))\s+(.+?)$")
+_RE_VS    = re.compile(r"^(.+?)\s+(?:vs?\.?|–|—|-|x)\s+(.+?)$", re.I)
+
+def _limpiar(ln):
+    ln = ln.strip()
+    pref = [rf"^{_DIAS}\w*\.?,?\s+", r"^\d{1,2}[:.]\d{2}\s+",
+            r"^\d{1,2}[/\-.]\d{1,2}([/\-.]\d{2,4})?\s+",
+            rf"^\d{{1,2}}\s+{_MESES}\w*\.?,?\s+", rf"^{_MESES}\w*\.?\s+\d{{1,2}},?\s+"]
+    ch = True
+    while ch:
+        ch = False
+        for p in pref:
+            nu = re.sub(p, "", ln, flags=re.I)
+            if nu != ln: ln = nu; ch = True
+    ln = re.sub(r"\s*\(.*?\)\s*$", "", ln)
+    ln = re.sub(r"\s*(FT|Finalizado|Final|Termin\w*|Ver resumen|Resumen)\s*$", "", ln, flags=re.I)
+    return ln.strip()
+
+def _norm(t): return re.sub(r"\s+", " ", t).strip(" -–—\t")
+def _let(t):  return bool(re.search(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]", t))
+
+def parsear_resultados(texto):
+    jug, pen, eq = [], [], []
+    def add(t):
+        if t and t not in eq: eq.append(t)
+    for raw in texto.splitlines():
+        ln = _limpiar(raw)
+        if not ln: continue
+        m = _RE_SCORE.match(ln)
+        if m:
+            loc, vis = _norm(m.group(1)), _norm(m.group(5))
+            gl = int(m.group(2)); gv = int(m.group(3) if m.group(3) is not None else m.group(4))
+            if _let(loc) and _let(vis): add(loc); add(vis); jug.append((loc, vis, gl, gv)); continue
+        m = _RE_VS.match(ln)
+        if m:
+            loc, vis = _norm(m.group(1)), _norm(m.group(2))
+            if _let(loc) and _let(vis) and not re.search(r"\d", loc + vis):
+                add(loc); add(vis); pen.append((loc, vis))
+    jp = {frozenset((l, v)) for l, v, _, _ in jug}
+    pp = {frozenset(p) for p in pen}
+    for a, b in combinations(eq, 2):
+        fs = frozenset((a, b))
+        if fs not in jp and fs not in pp: pen.append((a, b)); pp.add(fs)
+    return eq, jug, pen
+
+_RE_HEADER = re.compile(r"^\s*(grupo|group|gpo)\s*[:.]?\s*([A-Za-z0-9]+)\s*[:.]?\s*$", re.I)
+
+def dividir_grupos(texto):
+    g, act, suelto = {}, None, []
+    for ln in texto.splitlines():
+        m = _RE_HEADER.match(ln.strip())
+        if m: act = m.group(2).upper(); g.setdefault(act, [])
+        else: (g[act] if act is not None else suelto).append(ln)
+    if not g and any(s.strip() for s in suelto): g["Único"] = suelto
+    return {k: "\n".join(v) for k, v in g.items()}
+
+# ─── API ─────────────────────────────────────────────────────────────────────────
+_FIN = {"FINISHED", "AWARDED"}
+
+def _grp(lbl): return re.split(r"[ _]", str(lbl).strip())[-1].upper() if lbl else "?"
+def _nom(t):   return (t.get("shortName") or t.get("name") or t.get("tla") or "¿?").strip()
+
+def matches_a_texto(matches):
+    grupos = {}; liga = []
+    for m in matches:
+        loc, vis = _nom(m["homeTeam"]), _nom(m["awayTeam"])
+        ft = (m.get("score") or {}).get("fullTime") or {}; gl, gv = ft.get("home"), ft.get("away")
+        jugado = m.get("status") in _FIN and gl is not None and gv is not None
+        linea = f"{loc} {gl}-{gv} {vis}" if jugado else f"{loc} vs {vis}"
+        if "GROUP" in str(m.get("stage", "")).upper() or m.get("group"):
+            grupos.setdefault(_grp(m.get("group")), []).append(linea)
+        elif str(m.get("stage", "")).upper() == "REGULAR_SEASON":
+            liga.append(linea)
+    out = []
+    if grupos:
+        for g in sorted(grupos):
+            out += [f"Grupo {g}", *grupos[g], ""]
+    elif liga:
+        out += liga  # liga entera: una sola tabla, sin encabezado de grupo
+    return "\n".join(out).strip()
+
+def traer_de_api(token, comp="WC"):
+    base = f"https://api.football-data.org/v4/competitions/{comp}"
+    h = {"X-Auth-Token": (token or "").strip()}
+    r = requests.get(base + "/matches", headers=h, timeout=30)
+    if r.status_code == 200:
+        return r.json().get("matches", [])
+    # football-data manda el motivo real en el cuerpo JSON
+    try:
+        msg = r.json().get("message", "") or r.text[:200]
+    except Exception:
+        msg = (r.text or "")[:200]
+    # Si falla sin temporada, busco la temporada actual y reintento (útil para copas como el Mundial)
+    try:
+        info = requests.get(base, headers=h, timeout=30)
+        if info.status_code == 200:
+            cs = info.json().get("currentSeason") or {}
+            yr = str(cs.get("startDate") or "")[:4]
+            if yr:
+                r2 = requests.get(base + f"/matches?season={yr}", headers=h, timeout=30)
+                if r2.status_code == 200:
+                    return r2.json().get("matches", [])
+                try:
+                    msg = r2.json().get("message", "") or msg
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    raise RuntimeError(f"{r.status_code} — {msg}" if msg else f"{r.status_code} (sin detalle de la API)")
+
+def listar_competiciones(token):
+    r = requests.get("https://api.football-data.org/v4/competitions",
+                     headers={"X-Auth-Token": token}, timeout=30)
+    r.raise_for_status()
+    return [(c.get("code"), c.get("name")) for c in r.json().get("competitions", [])]
+
+# ─── HELPER: cargar estado ────────────────────────────────────────────────────────
+def cargar_estado(equipos, jugados, pendientes):
+    mg = elegir_max_goles(len(pendientes))
+    total = (mg+1)**(2*len(pendientes))
+    if total > 200000:   # demasiados partidos (liga): no se puede enumerar, vamos por puntos
+        st.session_state.ESTADO = dict(equipos=equipos, jugados=jugados, pendientes=pendientes,
+                                       esc=None, mg=mg, solo_puntos=True)
+        return
+    with st.spinner(f"Calculando {total:,} escenarios…"):
+        esc = todos_los_escenarios(equipos, jugados, pendientes, mg)
+    st.session_state.ESTADO = dict(equipos=equipos, jugados=jugados, pendientes=pendientes,
+                                   esc=esc, mg=mg, solo_puntos=False)
+    return esc
+
+def _procesar_import(jg, pd_, ligas, filtro, solo_fixture=False):
+    """Carga lo importado: como estado completo, o solo como fixture de la liga (tabla) ya cargada."""
+    if len(ligas) > 1 and not (filtro or "").strip():
+        st.warning("Hay varias ligas en el export. Afiná el filtro con alguna de estas:")
+        for lg, cnt in sorted(ligas.items(), key=lambda kv: -kv[1])[:12]:
+            st.caption(f"· {lg} ({cnt})")
+        return False
+    if solo_fixture:
+        E = st.session_state.ESTADO
+        if not (E and E.get("modo") == "liga_tabla"):
+            st.error("Primero cargá la tabla (fuente «Pegar tabla + fixture»)."); return False
+        pares, caidos = mapear_fixture(pd_ or [], E["equipos"])
+        if not pares:
+            st.error("No pude emparejar los partidos con los equipos de tu tabla. Revisá los nombres."); return False
+        E["pendientes"] = pares
+        E["rest"] = liga_restantes(E["equipos"], pares, None)
+        E["gleft"] = None
+        st.session_state.ESTADO = E
+        st.success(f"Fixture actualizado: {len(pares)} partidos emparejados" +
+                   (f" ({len(caidos)} sin emparejar: {', '.join(caidos[:3])}…)" if caidos else " ✓"))
+        return True
+    eqs_imp = sorted({t for par in ((jg or []) + (pd_ or [])) for t in (par[0], par[1])})
+    if len(eqs_imp) < 3:
+        st.error("Muy pocos equipos tras el filtro. Revisá el filtro o el export."); return False
+    if not jg and not pd_:
+        st.error("No encontré partidos válidos tras el filtro."); return False
+    cargar_estado(eqs_imp, jg, pd_)
+    st.success(f"Importados {len(jg)} resultados y {len(pd_)} por jugar ({len(eqs_imp)} equipos) ✓")
+    return True
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+st.markdown("""
+<div class="main-header">
+  <h1>⚽ Calculadora del Fútbol Argentino</h1>
+  <p>Liga Profesional 2026 · Playoffs, descenso (anual y promedios) y copas internacionales</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TAREA 3 — Resultados partido a partido (forma / rachas / local-visitante)
+#  Alimenta forma_equipo / racha_equipo / local_visitante_df y la fuerza del
+#  simulador. La tabla (puntos/PJ/DG) sigue siendo la fuente autoritativa; estos
+#  resultados se usan solo para forma/rachas/localía, nunca se re-suman a los puntos.
+# ═══════════════════════════════════════════════════════════════════════════
+RESULTADOS_LPF_2026 = """Belgrano 2-1 Rosario Central
+Sarmiento 2-3 Argentinos
+Defensa y Justicia 1-1 Aldosivi
+Gimnasia (Mza.) 1-0 Central Córdoba
+Racing 2-1 Gimnasia
+Vélez 1-0 Instituto
+Huracán 1-0 Banfield
+Platense 2-2 Unión
+Estudiantes (Río Cuarto) 1-0 Tigre
+Newell's 1-0 Talleres
+River 0-1 Barracas Central
+Lanús 1-0 San Lorenzo
+Atlético Tucumán 0-0 Ind. Rivadavia Mza.
+Estudiantes 0-2 Independiente
+Deportivo Riestra 3-0 Boca"""
+
+def parse_resultados_lpf(text=None, canon=None):
+    """Parsea líneas «Local G1-G2 Visita» → lista de tuplas (local, visita, gl, gv)
+    con nombres canónicos. Ignora líneas que no matcheen."""
+    import re
+    if text is None:
+        text = RESULTADOS_LPF_2026
+    if canon is None:
+        canon = canon_club
+    rgx = re.compile(r"^(.*?)\s+(\d+)\s*[-–:]\s*(\d+)\s+(.*)$")
+    out = []
+    for raw in str(text).splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        m = rgx.match(ln)
+        if not m:
+            continue
+        out.append((canon(m.group(1)), canon(m.group(4)), int(m.group(2)), int(m.group(3))))
+    return out
+
+def _lpf_forma_zona_df(base, jugados, n=5):
+    """Tabla de forma de una zona SIN usar _stats (tolera rivales de la otra zona en
+    los interzonales): puntos de la tabla + forma/racha por equipo."""
+    rows = []
+    for e in base:
+        ult, p5 = forma_equipo(e, jugados, n)
+        rows.append({"Equipo": e, "PTS": base[e]["pts"], "Últimos 5": "".join(ult) or "—",
+                     "Pts últ. 5": p5, "Racha": racha_equipo(e, jugados)})
+    return pd.DataFrame(rows).sort_values(["Pts últ. 5", "PTS"], ascending=False).reset_index(drop=True)
+
+def _fuerza_lpf(base, jugados=None):
+    """Fuerza por equipo anclada en los puntos por partido de la tabla (autoritativa),
+    con 30% de peso a la forma reciente (últimos 3) si hay resultados cargados.
+    Sin resultados equivale a _fuerza_liga (solo puntos)."""
+    if not jugados:
+        return _fuerza_liga(base)
+    eqs = list(base.keys())
+    ppg = {e: (base[e]["pts"] / base[e].get("pj", 1)) if base[e].get("pj") else 1.0 for e in eqs}
+    forma = {}
+    for e in eqs:
+        ult, p = forma_equipo(e, jugados, 3)
+        forma[e] = (p / len(ult)) if ult else ppg[e]
+    mix = {e: 0.7 * ppg[e] + 0.3 * forma[e] for e in eqs}
+    med = sum(mix.values()) / len(mix) if mix else 0.0
+    if not med:
+        return _fuerza_liga(base)
+    return {e: min(1.8, max(0.4, mix[e] / med)) for e in eqs}
+
+
+LPF_APERTURA_PJ = 16   # el Apertura 2026 tuvo 16 fechas: su tabla es fija para los 30
+
+def lpf_apertura_desde_anual(anual, zonas, jugados=None, games=None):
+    """Deriva la tabla FIJA del Apertura a partir de la Anual cargada.
+
+    El Apertura terminó, así que su tabla no cambia más. Guardándola, la Anual se
+    recalcula siempre como Apertura + zonas actuales y ya no puede quedar vieja
+    respecto de las zonas (origen de varios números incorrectos).
+
+    Ojo: la Anual cargada puede incluir sólo parte del Clausura. Por eso no se resta
+    la zona entera, sino únicamente los partidos de Clausura que la Anual sí incorporó
+    (`anual_pj - 16`), tomados de los resultados conocidos.
+    """
+    games = games or LPF_FIXTURE
+    fmap = {(g["l"], g["v"]): g["f"] for g in games}
+    porfecha = {}
+    for (l, v, gl, gv) in (jugados or []):
+        f = fmap.get((l, v))
+        if f is None:
+            continue
+        porfecha.setdefault(l, []).append((f, gl, gv))
+        porfecha.setdefault(v, []).append((f, gv, gl))
+    ap = {}
+    for lab, base in (zonas or {}).items():
+        for e in base:
+            a = (anual or {}).get(e)
+            if not a:
+                continue
+            n_inc = int(a.get("pj", 0)) - LPF_APERTURA_PJ      # partidos de Clausura ya sumados
+            pts = int(a.get("pts", 0)); pj = int(a.get("pj", 0))
+            gf = int(a.get("gf", 0)); ga = int(a.get("ga", 0))
+            if n_inc > 0:
+                mios = sorted(porfecha.get(e, []))[:n_inc]
+                for (_f, favor, contra) in mios:
+                    pts -= 3 if favor > contra else (1 if favor == contra else 0)
+                    pj -= 1; gf -= favor; ga -= contra
+                if len(mios) < n_inc:                # faltan resultados para restar
+                    ap[e] = {"pts": pts, "pj": pj, "dg": gf - ga, "gf": gf, "ga": ga, "_dudoso": True}
+                    continue
+            ap[e] = {"pts": pts, "pj": pj, "dg": gf - ga, "gf": gf, "ga": ga}
+    return ap
+
+def cargar_lpf_todo():
+    """Carga offline completa desde las constantes internas: Tabla Anual + Promedios
+    + Zonas A y B + fixture de las 16 fechas. Devuelve (nA, nB, nAnual, nPend)."""
+    if not st.session_state.get("LPF_ANUAL"):
+        st.session_state.LPF_ANUAL = parse_tabla_anual(TABLA_ANUAL_LPF_2026)[0]
+        _pv0 = parse_promedios_tabla(PROMEDIOS_LPF_2026)[0]
+        st.session_state.PROM_TXT = promedios_previas_texto(_pv0)
+        st.session_state.PROMEDIOS = parse_promedios(st.session_state.PROM_TXT)
+        st.session_state.LPF_HIST_OK = f"{len(st.session_state.LPF_ANUAL)} equipos en la anual \u00b7 {len(_pv0)} en promedios"
+    _bA = parse_tabla_anual(ZONA_A_LPF_2026)[0]
+    _bB = parse_tabla_anual(ZONA_B_LPF_2026)[0]
+    _Zc = {"A": canon_base(_bA), "B": canon_base(_bB)}
+    _eqc = [e for b in _Zc.values() for e in b]
+    _restc = {e: max(0, LPF_FECHAS_TOTAL - d.get("pj", 0)) for b in _Zc.values() for e, d in b.items()}
+    _pend = lpf_pendientes(_Zc)
+    _jug = parse_resultados_lpf(st.session_state.get("LPF_RES_TXT") or None)
+    _anual_snap = st.session_state.get("LPF_ANUAL") or {}
+    st.session_state.ESTADO = dict(modo="lpf2026", equipos=_eqc, zonas_lpf=_Zc,
+                                   anual_directo=_anual_snap,   # se usa TAL CUAL lo cargado
+                                   pendientes=_pend, rest=_restc, apertura={},
+                                   camps=(st.session_state.get("lpf_c1", "Belgrano"),
+                                          st.session_state.get("lpf_c2", ""),
+                                          st.session_state.get("lpf_c3", "")),
+                                   intl=("", ""), n_anual=1, n_prom=1,
+                                   base={}, jugados=_jug, esc=None, mg=0, solo_puntos=True)
+    return len(_Zc["A"]), len(_Zc["B"]), len(st.session_state.get("LPF_ANUAL") or {}), len(_pend)
+
+
+def cargar_lpf_espn(liga="arg.1"):
+    """Refresco EN VIVO desde ESPN: tablas por zona con los PJ al día + resultados
+    partido a partido (para forma/rachas). El histórico (Anual + Promedios) se toma
+    de las constantes si no está cargado. Devuelve (resumen_dict, error)."""
+    Zx, err = espn_lpf_zonas(liga)
+    if err:
+        return None, err
+    jug_raw, pen_raw, nota, ferr = espn_fixture(liga, 120)
+    eqx = [e for b in Zx.values() for e in b]
+    eqset = set(eqx)
+    jugados = []
+    for (ln, vn, gl, gv) in (jug_raw or []):
+        cl, cv = canon_club(ln), canon_club(vn)
+        if cl in eqset and cv in eqset:
+            jugados.append((cl, cv, gl, gv))
+    restx = {e: max(0, LPF_FECHAS_TOTAL - d.get("pj", 0)) for b in Zx.values() for e, d in b.items()}
+    if not st.session_state.get("LPF_ANUAL"):
+        st.session_state.LPF_ANUAL = parse_tabla_anual(TABLA_ANUAL_LPF_2026)[0]
+        _pv0 = parse_promedios_tabla(PROMEDIOS_LPF_2026)[0]
+        st.session_state.PROM_TXT = promedios_previas_texto(_pv0)
+        st.session_state.PROMEDIOS = parse_promedios(st.session_state.PROM_TXT)
+    _pend = lpf_pendientes(Zx)
+    st.session_state.ESTADO = dict(modo="lpf2026", equipos=eqx, zonas_lpf=Zx,
+                                   anual_directo=st.session_state.get("LPF_ANUAL") or {},
+                                   pendientes=_pend, rest=restx, apertura={},
+                                   camps=(st.session_state.get("lpf_c1", "Belgrano"),
+                                          st.session_state.get("lpf_c2", ""),
+                                          st.session_state.get("lpf_c3", "")),
+                                   intl=("", ""), n_anual=1, n_prom=1,
+                                   base={}, jugados=jugados, esc=None, mg=0, solo_puntos=True)
+    return {"A": len(Zx.get("A", {})), "B": len(Zx.get("B", {})),
+            "jug": len(jugados), "pend": len(_pend), "nota": nota or "", "fixture_err": ferr or ""}, None
+
+
+# ─── SIDEBAR ─────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("🔧 Configuración")
+
+    # Desempate
+    st.subheader("Criterio de desempate")
+    preset_sel = st.selectbox("Regla", list(PRESETS.keys()), label_visibility="collapsed")
+    if PRESETS[preset_sel] != st.session_state.CRITERIOS:
+        st.session_state.CRITERIOS = PRESETS[preset_sel]
+        if st.session_state.ESTADO:
+            E = st.session_state.ESTADO
+            if E.get("modo") != "lpf2026":
+                cargar_estado(E["equipos"], E["jugados"], E["pendientes"])
+            st.rerun()
+
+    st.divider()
+
+    # Estructura de clasificación
+    st.subheader("Estructura de clasificación")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.DIRECTO = st.number_input("Clasifican directos", min_value=1, max_value=10, value=st.session_state.DIRECTO)
+    with col2:
+        st.session_state.MEJORES_TERCEROS = st.number_input("Mejores 3ºs", min_value=0, max_value=20, value=st.session_state.MEJORES_TERCEROS,
+                                                              help="0 = los terceros NO clasifican")
+    st.session_state.CAMPEON = st.text_input("Nombre del 1º", value=st.session_state.CAMPEON,
+                                              help='Ej: "campeón", "1º de zona", "ganador del grupo"')
+
+    with st.expander("🎨 Zonas con nombre (para ligas)"):
+        st.caption("Pinta la tabla por zonas. Una por línea: «hasta_puesto nombre». Ej.: «3 Libertadores».")
+        _PZ = {"(sin zonas)": "",
+               "Liga Argentina (tabla anual)": "3 Libertadores\n9 Sudamericana\n29 Permanece\n30 Descenso",
+               "Clasificación simple": "4 Clasifica\n17 Permanece\n20 Descenso"}
+        _pzsel = st.selectbox("Preset", list(_PZ.keys()), key="zpreset")
+        if st.session_state.get("_zlast") != _pzsel:
+            st.session_state.ZONAS_TXT = _PZ[_pzsel]
+            st.session_state["_zlast"] = _pzsel
+        _ztxt = st.text_area("Zonas", value=st.session_state.ZONAS_TXT, height=120, label_visibility="collapsed")
+        st.session_state.ZONAS_TXT = _ztxt
+        st.session_state.ZONAS = parse_zonas(_ztxt)
+        if st.session_state.ZONAS:
+            st.caption("Activas: " + " · ".join(f"≤{h} {n}" for h, n, _ in st.session_state.ZONAS))
+
+    with st.expander("📉 Promedios (descenso a la argentina)"):
+        if "prom_tabla_fetch" in st.session_state:
+            st.session_state["prom_tabla_txt"] = st.session_state.pop("prom_tabla_fetch")
+        if st.button("🇦🇷 Cargar promedios LPF 2026 (previo a la fecha 2 del Clausura)", use_container_width=True):
+            st.session_state["prom_tabla_fetch"] = PROMEDIOS_LPF_2026
+            st.rerun()
+        _ptab = st.text_area("Pegá la tabla de promedios (formato Promiedos)", height=120, key="prom_tabla_txt",
+                             placeholder="1\nBoca Jrs.\nBoca Jrs.\n1.767\t159\t90\t67\t62\t30\n…")
+        if (_ptab or "").strip():
+            _pv, _pja, _avs = parse_promedios_tabla(_ptab)
+            if _pv:
+                st.session_state.PROM_TXT = promedios_previas_texto(_pv)
+                st.caption(f"Leí {len(_pv)} equipos · descuento {_pja} partidos ya jugados del 2026 "
+                           "(los puntos del 2026 los toma de las tablas cargadas, para no contarlos dos veces).")
+                st.warning("Para que el promedio dé exacto, cargá también la **fase de zonas del Apertura** "
+                           "en «📊 Tabla General»: si no, al 2026 le faltan esos puntos.")
+            for _a in (_avs or [])[:3]:
+                st.caption("⚠️ " + _a)
+        st.caption("O pegá las temporadas **previas** a mano: «Equipo, pts, pj».")
+        _ptxt = st.text_area("Temporadas previas", value=st.session_state.get("PROM_TXT", ""), height=100,
+                             placeholder="River, 123, 73\nBoca, 129, 73", label_visibility="collapsed")
+        st.session_state.PROM_TXT = _ptxt
+        st.session_state.PROMEDIOS = parse_promedios(_ptxt)
+        st.session_state.PROM_K = st.number_input("Descienden por promedio", 1, 5, int(st.session_state.get("PROM_K", 1)))
+        if st.session_state.PROMEDIOS:
+            st.caption(f"Cargadas previas de {len(st.session_state.PROMEDIOS)} equipos. Pedí «promedios» o «promedio de X» en el chat.")
+
+    st.divider()
+
+    # Cargar datos
+    st.subheader("📥 Cargar datos")
+    st.caption("Un solo bot\u00f3n carga todo. El resto es para editar a mano o traer de otra fuente.")
+    if st.button("\U0001F4E5 Cargar TODO (Clausura + Anual + Promedios)", use_container_width=True, type="primary", key="btn_cargar_todo_side"):
+        _a, _b, _an, _pn = cargar_lpf_todo()
+        st.success(f"Listo \u2713 Zona A ({_a}) \u00b7 Zona B ({_b}) \u00b7 Anual ({_an}) \u00b7 {_pn} partidos pendientes")
+        st.rerun()
+    st.caption("Incluye Zonas A y B, Tabla Anual y Promedios (datos internos, **previo a la fecha 2 del Clausura 2026**) "
+               "y el **fixture completo de las 16 fechas** para los cruces mano a mano.")
+    if st.button("\U0001F504 Actualizar a hoy (ESPN)", use_container_width=True, key="btn_espn_refresh_side"):
+        with st.spinner("Trayendo tablas y resultados de ESPN\u2026"):
+            _r, _e = cargar_lpf_espn("arg.1")
+        if _e:
+            st.warning(_e + "  \u2014 mientras tanto podés pegar las tablas en «Otras formas de cargar».")
+        else:
+            st.success(f"Actualizado desde ESPN \u2713 Zona A ({_r['A']}) \u00b7 Zona B ({_r['B']}) \u00b7 "
+                       f"{_r['jug']} resultados \u00b7 {_r['pend']} pendientes")
+            st.rerun()
+    st.caption("Trae las tablas con los **PJ al día** y los **resultados** (forma y rachas) en un clic. "
+               "_La Tabla Anual (copas/descenso) se actualiza aparte en «Otras formas de cargar»._")
+    with st.expander("\U0001F6E0\ufe0f Otras formas de cargar o editar a mano (avanzado)", expanded=False):
+        modo_carga = st.radio("Fuente", ["🇦🇷 LPF 2026 (Clausura: zonas A y B)", "Otra liga / copa (avanzado)"], label_visibility="collapsed")
+
+        if modo_carga == "🇦🇷 LPF 2026 (Clausura: zonas A y B)":
+            st.caption("Reglamento LPF 2026: dos zonas de 15, una rueda, 16 fechas. Clasifican los **8 primeros de cada zona** "
+                       "a Octavos. La **Tabla General** (para copas y descenso) suma Apertura + Clausura.")
+            if st.button("⚡ Traer el Clausura de ESPN (automático)", use_container_width=True):
+                with st.spinner("Consultando ESPN…"):
+                    _r, _e = cargar_lpf_espn("arg.1")
+                if _e:
+                    st.warning(_e)
+                else:
+                    st.success(f"Cargado de ESPN: Zona A ({_r['A']}) y Zona B ({_r['B']}) · {_r['jug']} resultados ✓")
+                    st.rerun()
+            _za = st.text_area("Tabla Zona A", height=130, key="lpf_a",
+                               placeholder="River Plate, 28, 12, +11\nBoca Juniors, 25, 12, +7\n…")
+            _zb = st.text_area("Tabla Zona B", height=130, key="lpf_b",
+                               placeholder="Racing, 27, 12, +9\nIndependiente, 22, 12, +3\n…")
+            _fx = st.text_area("Fixture que falta (opcional)", height=70, key="lpf_fx",
+                               placeholder="faltan 4 fechas\n— o los partidos: River Plate vs Boca Juniors …")
+            st.markdown("**Paso 1 — histórico (una sola vez)**")
+            if st.button("📦 Cargar Tabla Anual + Promedios LPF 2026", use_container_width=True, type="secondary"):
+                _anual_b, _av1 = parse_tabla_anual(TABLA_ANUAL_LPF_2026)
+                _prev_b, _pja_b, _av2 = parse_promedios_tabla(PROMEDIOS_LPF_2026)
+                st.session_state.LPF_ANUAL = _anual_b
+                st.session_state.PROM_TXT = promedios_previas_texto(_prev_b)
+                st.session_state.PROMEDIOS = parse_promedios(st.session_state.PROM_TXT)
+                st.session_state.LPF_HIST_OK = f"{len(_anual_b)} equipos en la anual · {len(_prev_b)} en promedios"
+                st.rerun()
+            if st.session_state.get("LPF_HIST_OK"):
+                st.success("Histórico cargado: " + st.session_state.LPF_HIST_OK + " ✓")
+            st.markdown("**Paso 2 — el Clausura de esta fecha**")
+            if st.button("🇦🇷 Cargar Zonas A y B del Clausura 2026", use_container_width=True, type="primary"):
+                if not st.session_state.get("LPF_ANUAL"):
+                    st.session_state.LPF_ANUAL = parse_tabla_anual(TABLA_ANUAL_LPF_2026)[0]
+                    _pv0 = parse_promedios_tabla(PROMEDIOS_LPF_2026)[0]
+                    st.session_state.PROM_TXT = promedios_previas_texto(_pv0)
+                    st.session_state.PROMEDIOS = parse_promedios(st.session_state.PROM_TXT)
+                    st.session_state.LPF_HIST_OK = f"{len(st.session_state.LPF_ANUAL)} equipos en la anual · {len(_pv0)} en promedios"
+                _bA, _avA = parse_tabla_anual(ZONA_A_LPF_2026)
+                _bB, _avB = parse_tabla_anual(ZONA_B_LPF_2026)
+                _Zc = {"A": canon_base(_bA), "B": canon_base(_bB)}
+                _eqc = [e for b in _Zc.values() for e in b]
+                _restc = {e: max(0, LPF_FECHAS_TOTAL - d.get("pj", 0)) for b in _Zc.values() for e, d in b.items()}
+                st.session_state.ESTADO = dict(modo="lpf2026", equipos=_eqc, zonas_lpf=_Zc,
+                                               anual_directo=st.session_state.get("LPF_ANUAL") or {},
+                                               pendientes=lpf_pendientes(_Zc), rest=_restc, apertura={},
+                                               camps=(st.session_state.get("lpf_c1", "Belgrano"), st.session_state.get("lpf_c2", ""),
+                                                      st.session_state.get("lpf_c3", "")),
+                                               intl=("", ""), n_anual=1, n_prom=1,
+                                               base={}, jugados=parse_resultados_lpf(st.session_state.get("LPF_RES_TXT") or None),
+                                               esc=None, mg=0, solo_puntos=True)
+                st.success(f"Zonas cargadas: A ({len(_Zc['A'])}) y B ({len(_Zc['B'])}) ✓")
+                st.rerun()
+            with st.expander("🥅 Resultados partido a partido (forma, rachas, local/visitante)"):
+                if "lpf_res_fetch" in st.session_state:
+                    st.session_state["lpf_res_box"] = st.session_state.pop("lpf_res_fetch")
+                if st.button("🇦🇷 Traer resultados LPF 2026 (Fecha 1)", use_container_width=True):
+                    st.session_state["lpf_res_fetch"] = RESULTADOS_LPF_2026
+                    st.rerun()
+                _resbox = st.text_area("Resultados «Local 2-1 Visita», uno por línea",
+                                       value=st.session_state.get("lpf_res_box", ""), height=140, key="lpf_res_box",
+                                       placeholder="River 2-1 Boca\nRacing 0-0 Independiente\n…")
+                st.session_state["LPF_RES_TXT"] = _resbox
+                _resn = len(parse_resultados_lpf(_resbox)) if (_resbox or "").strip() else 0
+                st.caption((f"Leo {_resn} partidos. Volvé a tocar «Cargar TODO» o «Cargar Zonas» para aplicarlos." if _resn
+                            else "Con esto se activan forma, rachas y rendimiento local/visitante, y el simulador pondera la forma reciente.")
+                           + " La tabla de posiciones manda igual; los resultados solo alimentan forma y localía.")
+            with st.expander("📊 Actualizar histórico a mano (opcional)"):
+                if "lpf_anual_fetch" in st.session_state:
+                    st.session_state["lpf_anual"] = st.session_state.pop("lpf_anual_fetch")
+                if st.button("🇦🇷 Cargar Tabla Anual LPF 2026 (previa a la fecha 2)", use_container_width=True):
+                    st.session_state["lpf_anual_fetch"] = TABLA_ANUAL_LPF_2026
+                    st.rerun()
+                _an = st.text_area("Tabla Anual pegada (formato Promiedos) — recomendado", height=110, key="lpf_anual",
+                                   placeholder="1\nIndependiente Riv.\n35\t17\t29:15\t14\t10\t5\t2\n…")
+                st.caption("De la anual saco solo el Apertura (le resto lo que ya se jugó del Clausura), "
+                           "así la tabla sigue viva fecha a fecha en vez de quedar congelada.")
+                _ap = st.text_area("…o pegá la fase de zonas del APERTURA", height=90, key="lpf_ap",
+                                   placeholder="River Plate, 30, 16, +14\nBoca Juniors, 29, 16, +12\n…")
+                _c1 = st.text_input("Campeón del Apertura 2026", value=st.session_state.get("lpf_c1", "Belgrano"), key="lpf_c1")
+                _c2 = st.text_input("Campeón del Clausura 2026 (si ya se definió)", key="lpf_c2")
+                _c3 = st.text_input("Campeón de la Copa Argentina 2026", key="lpf_c3")
+                _x1 = st.text_input("Campeón Libertadores 2026 (si es argentino)", key="lpf_x1",
+                                    help="Da una plaza ADICIONAL a Libertadores 2027 (art. 27.9).")
+                _x2 = st.text_input("Campeón Sudamericana 2026 (si es argentino)", key="lpf_x2",
+                                    help="Da una plaza ADICIONAL a Libertadores 2027 (art. 27.10).")
+                _na = st.number_input("Descensos por Tabla General", 0, 4, 1, key="lpf_na")
+                _np = st.number_input("Descensos por promedio", 0, 4, 1, key="lpf_np")
+            if st.button("✅ Cargar LPF 2026", use_container_width=True, type="primary"):
+                _ba, _p1, _g1 = parse_tabla_fixture((_za or "") + "\n" + (_fx or ""))
+                _bb, _p2, _g2 = parse_tabla_fixture((_zb or "") + "\n" + (_fx or ""))
+                if len(_ba) < 3 or len(_bb) < 3:
+                    st.error("Necesito las dos tablas (Zona A y Zona B), una línea por equipo: «Equipo, Pts, PJ, DG».")
+                else:
+                    _Z = {"A": canon_base(_ba), "B": canon_base(_bb)}
+                    _ba, _bb = _Z["A"], _Z["B"]
+                    if (_an or "").strip():
+                        _anual, _avA = parse_tabla_anual(_an)
+                        _bap, _avD = derivar_apertura(_anual, _Z)
+                        for _a in (_avA + _avD)[:3]:
+                            st.warning(_a)
+                    elif (_ap or "").strip():
+                        _bap = parse_tabla_fixture(_ap)[0]
+                    else:
+                        _bap = {}
+                    _eqs = list(_ba.keys()) + list(_bb.keys())
+                    _pend = _p1 or _p2 or []
+                    _pares, _ = mapear_fixture(_pend, _eqs) if _pend else ([], [])
+                    _gl = _g1 if _g1 is not None else _g2
+                    _rest = {e: max(0, LPF_FECHAS_TOTAL - d.get("pj", 0))
+                             for _bz in _Z.values() for e, d in _bz.items()}
+                    _anual_dir = st.session_state.get("LPF_ANUAL") or {}
+                    if (_an or "").strip():
+                        _anual_dir = parse_tabla_anual(_an)[0]
+                    st.session_state.ESTADO = dict(modo="lpf2026", equipos=_eqs, zonas_lpf=_Z,
+                                                   anual_directo=_anual_dir,
+                                                   pendientes=lpf_pendientes(_Z), rest=_rest, apertura=_bap,
+                                                   camps=(_c1, _c2, _c3), intl=(_x1, _x2), n_anual=int(_na), n_prom=int(_np),
+                                                   base={}, jugados=[], esc=None, mg=0, solo_puntos=True)
+                    st.success(f"LPF 2026 cargada: Zona A ({len(_ba)}) y Zona B ({len(_bb)}) ✓")
+                    st.rerun()
+            texto_torneo = ""
+
+        elif modo_carga == "Otra liga / copa (avanzado)" and False and "API ESPN (gratis, incluye Liga Argentina)":
+            st.caption("Gratis y sin token. Trae la **tabla** y los **partidos que faltan** (y las zonas sugeridas). "
+                       "Para ligas que no estén en la lista, escribí el código (ej.: `bra.1`, `por.1`).")
+            _lnom = st.selectbox("Liga", list(ESPN_LIGAS.keys()), key="espn_liga_sel")
+            _lcod = st.text_input("Código de liga", value=ESPN_LIGAS.get(_lnom, "arg.1"), key="espn_liga_cod")
+            _ldias = st.number_input("Traer partidos de los próximos (días)", 7, 365, 120, key="espn_dias")
+            if st.button("⚽ Traer de ESPN y cargar", use_container_width=True, type="primary"):
+                with st.spinner("Consultando ESPN…"):
+                    _base, _zon, _err = espn_tabla(_lcod)
+                if _err:
+                    st.error(_err)
+                else:
+                    with st.spinner("Buscando los partidos que faltan…"):
+                        _jg, _pd, _nota, _errf = espn_fixture(_lcod, _ldias)
+                    _eqs = list(_base.keys())
+                    _pares, _caidos = mapear_fixture(_pd or [], _eqs)
+                    _rest = liga_restantes(_eqs, _pares, None) if _pares else {e: 0 for e in _eqs}
+                    st.session_state.ESTADO = dict(modo="liga_tabla", equipos=_eqs, base=_base,
+                                                   pendientes=_pares, rest=_rest, gleft=None,
+                                                   jugados=[], esc=None, mg=0, solo_puntos=True)
+                    if _zon and not st.session_state.get("ZONAS"):
+                        st.session_state.ZONAS_TXT = _zon
+                        st.session_state.ZONAS = parse_zonas(_zon)
+                    _msg = f"Cargado de ESPN: {len(_eqs)} equipos · {len(_pares)} partidos por jugar"
+                    if _errf and not _pares:
+                        _msg += " (sin fixture: revisá los días o pegalo a mano)"
+                    st.success(_msg + f" {_nota} ✓")
+                    if _caidos:
+                        st.caption("Sin emparejar: " + ", ".join(_caidos[:3]) + ("…" if len(_caidos) > 3 else ""))
+                    st.rerun()
+            texto_torneo = ""
+
+        elif modo_carga == "Otra liga / copa (avanzado)" and False and "API football-data.org":
+            token = st.text_input("API Key", value=_secret("FOOTBALL_DATA_TOKEN", ""), type="password",
+                                   placeholder="Tu token de football-data.org",
+                                   help="Cargala una vez en Secrets (FOOTBALL_DATA_TOKEN) y queda precargada.")
+            comp  = st.text_input("Código torneo", value="WC",
+                                  help="Ej.: WC=Mundial, CL=Champions, PL=Premier, PD=LaLiga, SA=Serie A, "
+                                       "BL1=Bundesliga, FL1=Ligue 1, BSA=Brasileirão, PPL=Portugal, "
+                                       "DED=Eredivisie, ELC=Championship. Tocá «Ver torneos» para ver los tuyos.")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🌐 Traer datos", use_container_width=True):
+                    if not token:
+                        st.error("Pegá tu API key.")
+                    else:
+                        try:
+                            with st.spinner("Trayendo…"):
+                                matches = traer_de_api(token, comp)
+                            st.session_state.texto_torneo_cache = matches_a_texto(matches)
+                            st.success("Datos cargados ✓")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            with col2:
+                if st.button("Ver torneos", use_container_width=True):
+                    if token:
+                        try:
+                            st.session_state["lista_comps"] = listar_competiciones(token)
+                        except Exception as e:
+                            st.error(str(e))
+            if "lista_comps" in st.session_state:
+                for code, name in st.session_state["lista_comps"]:
+                    st.caption(f"`{code}` — {name}")
+            texto_torneo = st.session_state.texto_torneo_cache
+
+        elif modo_carga == "Otra liga / copa (avanzado)" and False and "Pegar tabla + fixture (ligas)":
+            if "liga_tabla_fetch" in st.session_state:
+                st.session_state["liga_tabla_txt"] = st.session_state.pop("liga_tabla_fetch")
+            st.caption("Pegá la **tabla** (una línea por equipo: «Equipo, Pts, PJ, DG»). Abajo, lo ideal es pegar el **fixture** que viene (líneas «River vs Boca») para captar los cruces entre rivales; si no, poné «faltan N fechas» (atajo, no ve los cruces).")
+            with st.expander("🌐 Traer la tabla desde una URL (Wikipedia, gratis)"):
+                _LIGAS = {
+                    "— elegir —": "",
+                    "Argentina · Tabla acumulada (copas + un descenso)": "https://es.wikipedia.org/wiki/Campeonato_de_Primera_División_2025_(Argentina)",
+                    "Argentina · Tabla de promedios (descenso)": "https://es.wikipedia.org/wiki/Campeonato_de_Primera_División_2025_(Argentina)",
+                    "Premier League (Inglaterra)": "https://es.wikipedia.org/wiki/Premier_League_2025-26",
+                    "La Liga (España)": "https://es.wikipedia.org/wiki/Primera_División_de_España_2025-26",
+                    "Serie A (Italia)": "https://es.wikipedia.org/wiki/Serie_A_2025-26",
+                    "Brasileirão (Brasil)": "https://es.wikipedia.org/wiki/Campeonato_Brasileño_de_Serie_A_2025",
+                }
+                _lsel = st.selectbox("Liga (rellena el link solo)", list(_LIGAS.keys()), key="liga_preset")
+                if _LIGAS.get(_lsel) and st.session_state.get("_lsel_last") != _lsel:
+                    st.session_state["url_tabla"] = _LIGAS[_lsel]
+                    st.session_state["_lsel_last"] = _lsel
+                    st.rerun()
+                st.caption("Ojo Argentina: la acumulada y la de promedios se leen bien; el fixture de la fecha se pega aparte "
+                           "(o vía Apify). El torneo en curso por zonas no trae partidos legibles desde Wikipedia.")
+                url_tabla = st.text_input("URL de la página con la tabla", key="url_tabla",
+                                          placeholder="https://es.wikipedia.org/wiki/Torneo_… (página del torneo)")
+                if st.button("Leer tabla de la URL", use_container_width=True):
+                    txt_t, err_t = tabla_desde_url(url_tabla)
+                    if err_t:
+                        st.error(err_t)
+                    else:
+                        st.session_state["liga_tabla_fetch"] = txt_t
+                        st.rerun()
+                if st.button("Leer TODO: resultados + fixture (tabla cruzada) y cargar", use_container_width=True, type="primary"):
+                    jg2, pd2, err2, nota2 = partidos_desde_url(url_tabla)
+                    if err2:
+                        st.error(err2)
+                    elif not jg2 and not pd2:
+                        st.error("La matriz está vacía. Pegá tabla y fixture a mano.")
+                    else:
+                        eqs2 = sorted({t for par in (jg2 + pd2) for t in (par[0], par[1])})
+                        base2 = _stats(eqs2, jg2)
+                        rest2 = liga_restantes(eqs2, pd2, None)
+                        st.session_state.ESTADO = dict(modo="liga_tabla", equipos=eqs2, base=base2,
+                                                       pendientes=pd2, rest=rest2, gleft=None,
+                                                       jugados=jg2, esc=None, mg=0, solo_puntos=True)
+                        st.success(f"Cargado desde la matriz: {len(jg2)} resultados y {len(pd2)} por jugar ({nota2}) ✓")
+                        st.rerun()
+            tabla_txt = st.text_area("Tabla de posiciones", height=170,
+                                     placeholder="River Plate, 31, 14, +12\nBoca Juniors, 28, 14, +7\nRacing, 27, 14, +5\n...",
+                                     key="liga_tabla_txt")
+            fix_txt = st.text_area("Fechas que faltan (o fixture)", height=80,
+                                   placeholder="faltan 5 fechas\n— o pegá los partidos: River vs Boca …",
+                                   key="liga_fix_txt")
+            if st.button("✅ Cargar liga (tabla)", use_container_width=True, type="primary"):
+                base, pend, gleft = parse_tabla_fixture((tabla_txt or "") + "\n" + (fix_txt or ""))
+                if len(base) >= 3:
+                    eqs = list(base.keys()); rest = liga_restantes(eqs, pend, gleft)
+                    st.session_state.ESTADO = dict(modo="liga_tabla", equipos=eqs, base=base,
+                                                   pendientes=pend, rest=rest, gleft=gleft,
+                                                   jugados=[], esc=None, mg=0, solo_puntos=True)
+                    st.rerun()
+                else:
+                    st.error("No pude leer la tabla. Probá el formato «Equipo, Pts, PJ, DG» (una línea por equipo).")
+            texto_torneo = ""
+
+        elif modo_carga == "Otra liga / copa (avanzado)" and False and "Importar JSON/CSV (Apify u otra fuente)":
+            st.caption("Para ligas que no están en la API. Reconoce `homeTeam/awayTeam/homeScore/awayScore/status/league`: "
+                       "los terminados van como resultados y los programados como fixture.")
+            imp_fil = st.text_input("Filtrar por liga (texto que contenga)", key="imp_fil",
+                                    placeholder="ej.: liga profesional / argentina")
+            solo_fix = False
+            if st.session_state.ESTADO and st.session_state.ESTADO.get("modo") == "liga_tabla":
+                solo_fix = st.toggle("Usar solo como fixture de la tabla ya cargada", value=False,
+                                     help="Ideal: tabla pegada a mano + fixture automático. Empareja nombres aunque no coincidan exactos.")
+            with st.expander("⚡ Traer directo de Apify", expanded=True):
+                apify_tok = st.text_input("Apify token", value=_secret("APIFY_TOKEN", ""), type="password",
+                                          help="Gratis en apify.com → Settings → API tokens. Cargalo una vez en Secrets (APIFY_TOKEN).")
+                apify_act = st.text_input("Actor", value="crawlerbros/flashscore-scraper",
+                                          help="También sirve extractify-labs/flashscore-extractor (filtra por fecha −7..+7) o cualquier actor que devuelva partidos.")
+                apify_inp = st.text_area("Input del actor (JSON)", value='{"sport": "football", "liveOnly": false, "maxItems": 500}', height=70)
+                if st.button("🌐 Traer de Apify e importar", use_container_width=True, type="primary"):
+                    if not apify_tok:
+                        st.error("Pegá tu token de Apify (o cargalo en Secrets como APIFY_TOKEN).")
+                    else:
+                        try:
+                            import json as _json
+                            with st.spinner("Corriendo el actor…"):
+                                items = traer_de_apify(apify_tok, apify_act, apify_inp)
+                            jg, pd_, ligas, err = importar_partidos_json(_json.dumps(items), imp_fil)
+                            if err:
+                                st.error(err)
+                            elif _procesar_import(jg, pd_, ligas, imp_fil, solo_fix):
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            imp_txt = st.text_area("…o pegá el JSON/CSV exportado", height=140, key="imp_txt",
+                                   placeholder='[{"homeTeam":"Lanus","awayTeam":"Banfield","homeScore":1,"awayScore":0,'
+                                               '"status":"finished","league":"ARGENTINA: Liga Profesional"}, …]')
+            if st.button("✅ Importar y cargar", use_container_width=True):
+                jg, pd_, ligas, err = importar_partidos_json(imp_txt, imp_fil)
+                if err:
+                    st.error(err)
+                elif _procesar_import(jg, pd_, ligas, imp_fil, solo_fix):
+                    st.rerun()
+            texto_torneo = ""
+
+        else:
+            texto_torneo = st.text_area(
+                "Pegá los resultados",
+                height=200,
+                placeholder="Grupo A\nRiver Plate 1-0 Boca Juniors\nRacing 1-1 Independiente\n...",
+            )
+            if texto_torneo.strip():
+                st.session_state.texto_torneo_cache = texto_torneo
+
+        grupos_disponibles = list(dividir_grupos(texto_torneo).keys()) if texto_torneo.strip() else []
+
+        if grupos_disponibles:
+            grupo_sel = st.selectbox("📂 Grupo a analizar", grupos_disponibles)
+            if st.button("✅ Cargar grupo", use_container_width=True, type="primary"):
+                texto_grupo = dividir_grupos(texto_torneo).get(grupo_sel, "")
+                eq, jug, pen = parsear_resultados(texto_grupo)
+                if len(eq) >= 3:
+                    cargar_estado(eq, jug, pen)
+                    st.rerun()
+                else:
+                    st.error("No se detectaron suficientes equipos.")
+
+    if st.session_state.ESTADO:
+        E = st.session_state.ESTADO
+        st.divider()
+        if E.get("modo") == "lpf2026":
+            _txt, _ok = lpf_estado_datos(E.get("zonas_lpf"))
+            (st.success if _ok else st.warning)(_txt)
+        elif E.get("modo") == "liga_tabla":
+            st.success(f"Liga cargada (tabla) · {len(E['equipos'])} equipos")
+            falt = E.get("gleft")
+            st.caption((f"Faltan {falt} fechas" if falt else f"{len(E['pendientes'])} partidos pendientes") + " · cuentas por puntos.")
+        elif E.get("esc") is None:
+            st.success(f"Liga cargada · {len(E['equipos'])} equipos · modo por puntos")
+            st.caption(f"Pendientes: {len(E['pendientes'])} — son demasiados para enumerar marcador por marcador, así que voy por puntos.")
+        else:
+            st.success(f"Grupo cargado · {len(E['equipos'])} equipos · {len(E['esc']):,} escenarios")
+            st.caption(f"Máx goles/equipo: {E['mg']} · Pendientes: {len(E['pendientes'])}")
+
+# ─── MAIN TABS ───────────────────────────────────────────────────────────────────
+if not st.session_state.ESTADO:
+    st.info("\U0001F449 Todav\u00eda no cargaste datos. Toc\u00e1 el bot\u00f3n para cargar el Clausura 2026 completo (o tra\u00e9lo de ESPN).")
+    if st.button("\U0001F4E5 Cargar TODO (Clausura + Anual + Promedios)", type="primary", use_container_width=True, key="btn_cargar_todo_main"):
+        cargar_lpf_todo()
+        st.rerun()
+    with st.expander("\u2026o traerlo autom\u00e1tico de ESPN"):
+        if st.button("\u26a1 Traer el Clausura de ESPN (autom\u00e1tico)", use_container_width=True, key="btn_espn_main"):
+            with st.spinner("Consultando ESPN\u2026"):
+                _r, _e = cargar_lpf_espn("arg.1")
+            if _e:
+                st.error(_e)
+            else:
+                st.rerun()
+    st.stop()
+
+E = st.session_state.ESTADO
+equipos    = E["equipos"]
+jugados    = E["jugados"]
+pendientes = E["pendientes"]
+esc        = E["esc"]
+
+# ─── INTERFAZ DE CHAT ────────────────────────────────────────────────────────────
+import unicodedata, json, re as _re
+
+def _secret(k, default=""):
+    try:
+        return st.secrets.get(k, default)
+    except Exception:
+        return default
+
+if "LLM_KEY"   not in st.session_state: st.session_state.LLM_KEY   = _secret("ANTHROPIC_API_KEY", "")
+if "LLM_MODEL" not in st.session_state: st.session_state.LLM_MODEL = _secret("ANTHROPIC_MODEL", "claude-haiku-4-5")
+if "LLM_ON"    not in st.session_state: st.session_state.LLM_ON    = bool(str(st.session_state.LLM_KEY).strip())
+
+
+def _norm_txt(s):
+    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+
+
+def detectar_equipo(q, equipos):
+    qn = _norm_txt(q)
+    pares = [(e, _norm_txt(e)) for e in equipos]
+    full = [e for e, en in pares if en in qn]
+    if full:
+        return max(full, key=len)
+    for e, en in pares:
+        for w in en.split():
+            if len(w) >= 4 and w in qn:
+                return e
+    return None
+
+def detectar_equipos(q, equipos, k=2):
+    qn = _norm_txt(q); found = []
+    for e in sorted(equipos, key=lambda x: -len(x)):
+        if _norm_txt(e) in qn and e not in found:
+            found.append(e)
+        if len(found) >= k:
+            break
+    return found
+
+def _pos_pedida(qn):
+    m = _re.search(r"\b([1-9])\s*[oº°]?\b", qn)
+    if m:
+        return int(m.group(1))
+    for w, k in [("primer", 1), ("segundo", 2), ("tercer", 3), ("cuarto", 4), ("quinto", 5)]:
+        if w in qn:
+            return k
+    return None
+
+def _placa(spec, fname):
+    return ("placa", _html_tabla(spec), _png_tabla(spec), fname)
+
+def _placa_png(png, fname):
+    return ("placa", None, png, fname)
+
+
+# ─── NAVEGACIÓN ENTRE GRUPOS (si se cargó el torneo completo) ─────────────────────
+def _tour_grupos():
+    """Devuelve {label: (equipos, jugados, pendientes)} desde el texto del torneo."""
+    txt = st.session_state.get("texto_torneo_cache", "")
+    if not txt or not txt.strip():
+        return {}
+    out = {}
+    for lab, sub in dividir_grupos(txt).items():
+        try:
+            eqs, jug, pen = parsear_resultados(sub)
+        except Exception:
+            continue
+        if len(eqs) >= 3:
+            out[lab] = (eqs, jug, pen)
+    return out
+
+
+def _buscar_grupo_de(team_q):
+    for lab, (eqs, jug, pen) in _tour_grupos().items():
+        t = detectar_equipo(team_q, eqs)
+        if t:
+            return lab, t, (eqs, jug, pen)
+    return None, None, None
+
+
+AYUDA_MD = """**Todo esto funciona escribiéndolo (no hace falta el asistente Claude).** Ejemplos:
+
+**Qué necesita cada uno**
+- *¿Qué necesita River para los playoffs?* · *¿Puede salir campeón Racing?* · *¿Qué necesita Aldosivi para no descender?*
+- *¿Qué le conviene a Boca?* (su resultado + qué hinchar en los otros partidos)
+- *¿De quién depende?* (si cada equipo depende de sí mismo o necesita ayuda) · *Si terminara hoy*
+
+**Datos del grupo**
+- *Tabla* · *Panorama* · *Probabilidades* · *Número mágico de River* · *Máximos* · *Asegurados*
+
+**Buscar grupos** (con el torneo completo cargado)
+- *¿En qué zona está Belgrano?* · *Equipos de la Zona A*
+
+**Placas visuales (se descargan como imagen)**
+- *Grilla de River* — qué necesita, en cuadro de colores
+- *Comparar River y Boca* — cara a cara
+- *River puede salir 1º* — cuándo termina en ese puesto
+- *Mapa del grupo* — mapa de calor de en qué puesto termina cada uno
+- *¿Cómo viene River?* — explicación didáctica de sus chances, con medidor (placa)
+- *Árbol de River* — flowchart si/entonces: gana → clasifica, empata → depende, etc. (placa)
+- *Qué se juega cada equipo* — un renglón por equipo de todo el grupo, para placa o copete (placa)
+- *Previa de la fecha* — qué define cada partido que falta y qué pasa con cada resultado (texto + placa)
+- *Previa de River* (o *cómo puede terminar la fecha para River*) — su partido y entre qué puestos puede terminar la fecha, en playoffs/copas/descenso según le toque
+- *Proyección* — cuántos puntos junta cada uno si mantiene su ritmo (tabla)
+- *Ficha de River* — pts, ritmo, forma, racha, local/visitante, rivales que quedan y dificultad
+- *Forma* / *Racha* — tabla de últimos 5 · *De local y de visitante* — rendimiento por condición
+- *Calendario* — qué tan difícil es el fixture que le queda a cada uno
+- *Mejores terceros* — el tablero de los 12 terceros con la línea de corte (necesita el torneo completo; placa)
+- *Promedios* / *Promedio de X* — el descenso a la argentina, con piso, techo y análisis exacto (cargá las previas en el panel)
+- *Barras de River* — distribución de en qué puesto puede terminar (gráfico)
+- *Partido bisagra* — qué partido de los que faltan define más cosas
+- *Tabla por zonas* — para ligas: pinta la tabla por Libertadores/Sudamericana/descenso (configurá las zonas en el panel)
+
+**Simulador**
+- *¿Qué pasa si…?* — panel interactivo: elegís los resultados que faltan y ves la tabla, quién clasifica y la previa en prosa.
+
+**Entender el porqué**
+- Después de casi cualquier respuesta, escribí *¿por qué?* y te desarmo la cuenta en criollo.
+- Sirve sobre: *qué necesita X*, *ya clasificó / quedó afuera*, *número mágico*, *cómo viene X*, *partido bisagra*.
+
+**Para la nota**
+- *Contame el escenario de Boca* · *Relato de la zona* — texto listo para publicar
+
+Podés encadenar sin repetir el equipo: *«¿qué necesita Boca?»* y después *«¿y qué le conviene?»*.
+Si preguntás por un equipo de otro grupo, **cambio solo** a ese grupo."""
+
+AYUDA_LIGA = """Esto es una **liga** (muchas fechas): trabajo **por puntos**. Comandos:
+
+- **Tabla por zonas** — pinta Libertadores/Sudamericana/descenso (configurá las zonas en el panel)
+- **¿Qué necesita River para Libertadores?** · **…para no descender** · **…para Sudamericana**
+- **Número mágico de River** · **Máximos** (techo de cada uno) · **Asegurados top 4**
+- **Si terminara hoy** · Después de cualquier respuesta, **¿por qué?** te desarma la cuenta
+- **Chances de cada zona** (*probabilidades* o *¿cómo viene River?*) — simulación de miles de torneos, ideal a varias fechas del final
+- **Proyección** — puntos finales si cada uno mantiene su ritmo
+- **Comparar River y Boca** — cara a cara por puntos, techo y zona
+- **Ficha de River** · **Calendario** (dificultad del fixture restante, con fixture pegado)
+- **Promedios** · **Promedio de X** — descenso por promedios con temporadas previas (panel «📉 Promedios»)
+
+Si cargaste por **tabla + fechas**, con eso me alcanza para todas estas cuentas (no necesito los resultados).
+Configurá las zonas con nombre en «🎨 Zonas con nombre» del panel."""
+
+BIENVENIDA = ("👋 Soy la **calculadora de escenarios**. Preguntame en lenguaje natural: "
+              "*«¿qué necesita River para los playoffs?»*, *«¿cómo está el descenso?»*, *«copas 2027»*, "
+              "*«tabla»*… Si no te acordás el grupo de un equipo, preguntá igual y lo busco. "
+              "Escribí **ayuda** para ver todo.")
+
+
+# ─── EJECUTOR DETERMINÍSTICO (las cuentas las hace el motor, nunca el LLM) ─────────
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TAREA 4 — Previa de la fecha y árbol de un equipo POR SIMULACIÓN (modo LPF)
+#  Reusa el MISMO modelo que liga_probabilidades_df: fuerza por puntos/partido
+#  (_fuerza_liga), ventaja de localía y probabilidad de empate. No enumera
+#  marcadores: es estimación. Todo lo calcula Python; el número va rotulado.
+# ═══════════════════════════════════════════════════════════════════════════
+_LPF_PDRAW = 0.26
+_LPF_LOCALIA = 1.22
+_LPF_TOP_OCTAVOS = 8   # clasifican los 8 primeros de cada zona
+
+def _lpf_fecha_de(pend, games=None):
+    """Dict {(local, visita): fecha} para los pendientes, según el fixture."""
+    games = games or LPF_FIXTURE
+    fmap = {(g["l"], g["v"]): g["f"] for g in games}
+    return {(l, v): fmap.get((l, v)) for (l, v) in pend}
+
+def lpf_jornada_actual(pend, games=None, umbral=0.5, forzar=None):
+    """Distingue la JORNADA EN JUEGO de los PARTIDOS ATRASADOS.
+
+    Una fecha con pocos partidos pendientes (menos de `umbral` de su total) ya se
+    jugó casi entera: sus pendientes son POSTERGADOS y la jornada operativa pasa a
+    la fecha siguiente. Devuelve (jornada, juegos_de_la_jornada, atrasados) donde
+    `atrasados` son los pendientes de fechas anteriores a la jornada.
+    `forzar`: número de fecha para elegirla a mano (ignora la heurística)."""
+    games = games or LPF_FIXTURE
+    fmap = {(g["l"], g["v"]): g["f"] for g in games}
+    total_por_fecha = {}
+    for g in games:
+        total_por_fecha[g["f"]] = total_por_fecha.get(g["f"], 0) + 1
+    con = [((l, v), fmap[(l, v)]) for (l, v) in pend if (l, v) in fmap]
+    if not con:
+        return None, [], []
+    pend_por_fecha = {}
+    for lv, f in con:
+        pend_por_fecha.setdefault(f, []).append(lv)
+    fechas = sorted(pend_por_fecha)
+    if forzar is not None and forzar in pend_por_fecha:
+        jornada = forzar
+    else:
+        jornada = fechas[-1]
+        for f in fechas:
+            tot = total_por_fecha.get(f, 0)
+            # la fecha está "en juego" si le queda una porción relevante por jugar
+            if tot and len(pend_por_fecha[f]) >= umbral * tot:
+                jornada = f
+                break
+    juegos = pend_por_fecha.get(jornada, [])
+    atrasados = [(lv, f) for lv, f in con if f < jornada]
+    return jornada, juegos, atrasados
+
+def lpf_etiqueta_jornada(jornada, atrasados):
+    """Texto para titular la jornada, aclarando los postergados si los hay."""
+    if jornada is None:
+        return "sin partidos pendientes"
+    if not atrasados:
+        return f"Fecha {jornada}"
+    fs = sorted({f for _, f in atrasados})
+    n = len(atrasados)
+    det = ", ".join(str(f) for f in fs)
+    return (f"Fecha {jornada} (más {n} partido{'s' if n != 1 else ''} postergado"
+            f"{'s' if n != 1 else ''} de la fecha {det})")
+
+def lpf_equipos_con_atraso(pend, games=None):
+    """{equipo: partidos atrasados} — los que tienen partidos de fechas previas a
+    la jornada en juego (juegan menos partidos que el resto: distorsiona la tabla)."""
+    jornada, _, atrasados = lpf_jornada_actual(pend, games)
+    out = {}
+    for (l, v), _f in atrasados:
+        out[l] = out.get(l, 0) + 1
+        out[v] = out.get(v, 0) + 1
+    return out
+
+def _lpf_tipo_de(games=None):
+    games = games or LPF_FIXTURE
+    return {(g["l"], g["v"]): (g["tipo"], g.get("zona")) for g in games}
+
+def _lpf_prob_partido(l, v, s, pdraw=_LPF_PDRAW, loc=_LPF_LOCALIA):
+    """(p_local, p_empate, p_visita) con el modelo del simulador. Suman 1."""
+    wa = s.get(l, 1.0) * loc; wb = s.get(v, 1.0)
+    pa = (1 - pdraw) * wa / (wa + wb)
+    pb = (1 - pdraw) - pa
+    return max(0.0, pa), pdraw, max(0.0, pb)
+
+def lpf_previa_fecha_sim(Z, rest, pend, jugados=None, fecha=None):
+    """Previa de la PRÓXIMA fecha por jugar: para cada partido, probabilidad
+    estimada de que gane el local, empaten o gane la visita. Devuelve (fecha, df)
+    o (None, None) si no hay pendientes."""
+    base_all = {}
+    for b in Z.values():
+        base_all.update(b)
+    s = _fuerza_lpf(base_all, jugados)
+    fmap = _lpf_fecha_de(pend)
+    con_fecha = [(lv, f) for lv, f in fmap.items() if f is not None]
+    if not con_fecha:
+        return None, None
+    prox, juegos, atrasados = lpf_jornada_actual(pend, forzar=fecha)
+    if prox is None:
+        return None, None
+    tipo_map = _lpf_tipo_de()
+    fmap_f = {lv: f for lv, f in con_fecha}
+    def _orden(lv):
+        tipo, zona = tipo_map.get(lv, ("zona", "Z"))
+        return (0 if tipo == "zona" else 1, zona or "Z", lv[0])
+    rows = []
+    for (l, v) in sorted(juegos, key=_orden):
+        pl, pe, pv = _lpf_prob_partido(l, v, s)
+        tipo, zona = tipo_map.get((l, v), ("zona", None))
+        etiqueta = (f"Zona {zona}" if tipo == "zona" and zona else "Interzonal")
+        rows.append({"Partido": f"{l} – {v}", "Cuándo": f"Fecha {prox}", "Tipo": etiqueta,
+                     "Gana local %": round(100 * pl),
+                     "Empate %": round(100 * pe),
+                     "Gana visita %": round(100 * pv)})
+    for (l, v), f in sorted(atrasados, key=lambda x: (x[1], x[0][0])):
+        pl, pe, pv = _lpf_prob_partido(l, v, s)
+        tipo, zona = tipo_map.get((l, v), ("zona", None))
+        etiqueta = (f"Zona {zona}" if tipo == "zona" and zona else "Interzonal")
+        rows.append({"Partido": f"{l} – {v}", "Cuándo": f"Postergado F{f}", "Tipo": etiqueta,
+                     "Gana local %": round(100 * pl),
+                     "Empate %": round(100 * pe),
+                     "Gana visita %": round(100 * pv)})
+    return prox, pd.DataFrame(rows)
+
+def _sim_zone_pos(base, rest, pend, target, n, seed, forced=None,
+                  pdraw=_LPF_PDRAW, loc=_LPF_LOCALIA, jugados=None):
+    """Array (n,) con la posición final de `target` dentro de su zona, simulando
+    los pendientes. `forced` fija resultados {(l,v): 'L'|'E'|'V'} (se aplican de
+    forma determinística; sirve para las ramas del árbol, incluidos interzonales)."""
+    rng = np.random.default_rng(seed)
+    eqs = list(base.keys()); idx = {e: i for i, e in enumerate(eqs)}
+    s = _fuerza_lpf(base, jugados)
+    pts = np.tile(np.array([base[e]["pts"] for e in eqs], float), (n, 1))
+    dg0 = np.array([float(base[e].get("dg", 0)) for e in eqs])
+    forced = dict(forced or {})
+    consumidos = {e: 0 for e in eqs}
+    # 1) resultados forzados (deterministas), aplicados a los que estén en la zona
+    for (a, b), o in forced.items():
+        for e in (a, b):
+            if e in idx:
+                consumidos[e] += 1
+        if o == "L" and a in idx: pts[:, idx[a]] += 3
+        elif o == "V" and b in idx: pts[:, idx[b]] += 3
+        elif o == "E":
+            if a in idx: pts[:, idx[a]] += 1
+            if b in idx: pts[:, idx[b]] += 1
+    # 2) cruces intra-zona pendientes (no forzados): simulados con localía
+    en_fix = {e: 0 for e in eqs}
+    for (a, b) in pend:
+        if a in idx and b in idx and (a, b) not in forced:
+            en_fix[a] += 1; en_fix[b] += 1
+            pa = (1 - pdraw) * (s[a] * loc) / (s[a] * loc + s[b])
+            u = rng.random(n); ga = u < pa; gb = u >= pa + pdraw
+            pts[:, idx[a]] += np.where(ga, 3, np.where(gb, 0, 1))
+            pts[:, idx[b]] += np.where(gb, 3, np.where(ga, 0, 1))
+    # 3) el resto (interzonales + lo no cargado) contra rival promedio
+    for e in eqs:
+        extra = max(0, rest.get(e, 0) - en_fix[e] - consumidos[e])
+        if extra:
+            pa = (1 - pdraw) * s[e] / (s[e] + 1.0)
+            u = rng.random((n, extra))
+            pts[:, idx[e]] += np.where(u < pa, 3, np.where(u < pa + pdraw, 1, 0)).sum(axis=1)
+    key = pts + dg0[None, :] * 1e-4 + rng.random((n, len(eqs))) * 1e-7
+    pos = np.argsort(np.argsort(-key, axis=1), axis=1) + 1
+    return pos[:, idx[target]]
+
+def lpf_arbol_sim(equipo, Z, rest, pend, top=_LPF_TOP_OCTAVOS, seed=17, jugados=None):
+    """Árbol por simulación: cómo cambian las chances de entrar a octavos (top 8
+    de la zona) según el resultado del PRÓXIMO partido del equipo, más el 'partido
+    bisagra' de los próximos tres. Devuelve (texto, df) o (None, None)."""
+    lab = lpf_zona_de_equipo(equipo, Z)
+    if not lab or equipo not in Z.get(lab, {}):
+        return None, None
+    base = Z[lab]
+    fmap = _lpf_fecha_de(pend)
+    mios = sorted([((l, v), f) for (l, v), f in fmap.items()
+                   if equipo in (l, v) and f is not None], key=lambda x: x[1])
+    if not mios:
+        return None, None
+    n = 12000 if len(pend) <= 30 else 5000        # con pocas fechas, casi exacto
+    casi = len(pend) <= 30
+    def chance(forced):
+        pos = _sim_zone_pos(base, rest, pend, equipo, n, seed, forced=forced, jugados=jugados)
+        return 100.0 * float((pos <= top).mean())
+    base_ch = chance(None)
+    (l, v), fx = mios[0]
+    rival = v if l == equipo else l
+    localia = "de local" if l == equipo else "de visitante"
+    win = "L" if l == equipo else "V"
+    lose = "V" if l == equipo else "L"
+    ch_g = chance({(l, v): win}); ch_e = chance({(l, v): "E"}); ch_p = chance({(l, v): lose})
+    df = pd.DataFrame([
+        {"Si en la Fecha " + str(fx): f"le gana a {rival} ({localia})", "Chances de octavos": f"{round(ch_g)}%"},
+        {"Si en la Fecha " + str(fx): f"empata con {rival}", "Chances de octavos": f"{round(ch_e)}%"},
+        {"Si en la Fecha " + str(fx): f"pierde con {rival}", "Chances de octavos": f"{round(ch_p)}%"},
+    ])
+    # partido bisagra entre los próximos tres
+    swings = []
+    for (ll, vv), ff in mios[:3]:
+        gw = "L" if ll == equipo else "V"; lw = "V" if ll == equipo else "L"
+        sg = chance({(ll, vv): gw}); sp = chance({(ll, vv): lw})
+        riv = vv if ll == equipo else ll
+        swings.append((abs(sg - sp), riv, ff, sg, sp))
+    swings.sort(reverse=True)
+    sw = swings[0]
+    L = [f"**Árbol de {equipo}** — chances de entrar a octavos (los 8 primeros de la Zona {lab}).",
+         f"Hoy, sin jugar nada, está en **{round(base_ch)}%**.",
+         f"Su próximo partido es en la **Fecha {fx}** {localia} ante **{rival}**:"]
+    if len(swings) > 1 and sw[0] >= 3:
+        L.append(f"De los próximos partidos, el **bisagra es ante {sw[1]} (Fecha {sw[2]})**: "
+                 f"ganarlo lo pone en {round(sw[3])}% y perderlo lo deja en {round(sw[4])}%.")
+    L.append("_Estimación por simulación" + (" (prácticamente exacta: quedan pocos partidos)" if casi else
+             f" ({n:,} torneos)") + ". Los veredictos «ya está» / «quedó afuera» son exactos; esto es una probabilidad, no un pronóstico._")
+    return "\n\n".join(L), df
+
+
+def lpf_otros_resultados_sim(equipo, Z, rest, pend, top=_LPF_TOP_OCTAVOS, jugados=None, seed=19, fecha=None):
+    """«La otra cancha»: para la PRÓXIMA fecha, qué resultado de cada partido de los
+    rivales de su zona le conviene al equipo, medido por su chance de entrar a octavos.
+    Devuelve (texto, df) o (None, None)."""
+    lab = lpf_zona_de_equipo(equipo, Z)
+    if not lab or equipo not in Z.get(lab, {}):
+        return None, None
+    base = Z[lab]
+    fmap = _lpf_fecha_de(pend)
+    con_fecha = [(lv, f) for lv, f in fmap.items() if f is not None]
+    if not con_fecha:
+        return None, None
+    prox, jgs, atrs = lpf_jornada_actual(pend, forzar=fecha)
+    if prox is None:
+        return None, None
+    _todos = list(jgs) + [lv for lv, _f in atrs]      # la jornada + los postergados
+    juegos = [(l, v) for (l, v) in _todos
+              if equipo not in (l, v) and (l in base or v in base)]
+    if not juegos:
+        return None, None
+    n = 20000
+    def chance(forced):
+        pos = _sim_zone_pos(base, rest, pend, equipo, n, seed, forced=forced, jugados=jugados)
+        return 100.0 * float((pos <= top).mean())
+    base_ch = chance(None)
+    UMBRAL = 1.0   # menos de 1 punto de probabilidad = indistinguible del ruido a esta altura
+    rows = []
+    for (l, v) in juegos:
+        opts = {"L": chance({(l, v): "L"}), "E": chance({(l, v): "E"}), "V": chance({(l, v): "V"})}
+        best = max(opts, key=opts.get); worst = min(opts, key=opts.get)
+        imp = opts[best] - opts[worst]
+        etq = {"L": f"que gane {l}", "E": "que empaten", "V": f"que gane {v}"}
+        reco = etq[best] if imp >= UMBRAL else "da igual"
+        rows.append({"Partido": f"{l} – {v}", "Te conviene": reco,
+                     "Te cambia": (f"{imp:.1f} pts" if imp >= UMBRAL else "—"), "_imp": imp})
+    rows.sort(key=lambda r: -r["_imp"])
+    df = pd.DataFrame([{"Partido": r["Partido"], "Te conviene": r["Te conviene"], "Te cambia": r["Te cambia"]} for r in rows])
+    top1 = rows[0]
+    L = [f"**La otra cancha para {equipo}** — Fecha {prox}. Hoy tu chance de octavos es **{round(base_ch)}%**."]
+    if top1["_imp"] < UMBRAL:
+        L.append("Esta fecha los partidos de tus rivales **casi no te mueven la aguja** (faltan muchos partidos): "
+                 "depende más de lo que hagas vos. Esta vista pega fuerte en el tramo final.")
+    else:
+        L.append(f"El que más te mueve la aguja es **{top1['Partido']}**: te conviene **{top1['Te conviene']}** "
+                 f"(te cambia {top1['Te cambia']} tu chance de octavos).")
+    L.append("_Estimación por simulación. A veces conviene un empate (para que dos rivales no sumen de a 3) y a veces "
+             "que gane uno (para frenar al otro); por eso se calcula, no se supone._")
+    return "\n\n".join(L), df
+
+
+def _empatados_en_tope(equipo, tabla, pts_de, games):
+    """Equipos que quedarían IGUALADOS en puntos con el objetivo en su mejor caso.
+    Sirve para no cantar un puesto que en realidad depende de ganar el desempate."""
+    tope = pts_de(equipo) + 3
+    juegan = {x for lv in games for x in lv}
+    out = []
+    for e in tabla:
+        if e == equipo:
+            continue
+        piso_e = pts_de(e)                      # si pierde, se queda como está
+        techo_e = piso_e + (3 if e in juegan else 0)
+        if piso_e <= tope <= techo_e:           # puede terminar empatado en puntos
+            out.append(e)
+    return out
+
+def _rango_puesto_fecha(target, tabla, score_after, games):
+    """Mejor/peor puesto por puntos, incluyendo la incertidumbre del desempate.
+
+    ``score_after`` se conserva por compatibilidad con los llamadores, pero la
+    cuenta no congela la diferencia de gol actual: un resultado futuro la cambia.
+    Los equipos igualados pueden favorecer o perjudicar al objetivo y el texto lo
+    muestra como intervalo, en vez de inventar quién gana el desempate.
+    """
+    base = {e: {"pts": int(score_after(e, 0)[0] if isinstance(score_after(e, 0), tuple)
+                                  else score_after(e, 0))} for e in tabla}
+    r = next_round_rank_bounds(target, base, games)
+    if not r:
+        return r
+    # Red de seguridad: ningún puesto puede caer fuera de 1..N. Si pasa, hay un
+    # equipo contado dos veces (por ejemplo, si `games` trae partidos de dos fechas).
+    n = len(base)
+    b, w = r
+    return max(1, min(b, n)), max(1, min(w, n))
+
+
+def _rango_puesto_fecha_score(target, tabla, score_after, games):
+    """Versión genérica para cocientes (promedios), donde no hay DG futura."""
+    if target not in tabla:
+        return None
+    best_target = score_after(target, 3)
+    worst_target = score_after(target, 0)
+    best_above = worst_above = 0
+    seen = {target}
+    for local, visitor in games:
+        if target in (local, visitor):
+            rival = visitor if local == target else local
+            if rival in tabla:
+                seen.add(rival)
+                best_above += int(score_after(rival, 0) > best_target)
+                worst_above += int(score_after(rival, 3) > worst_target)
+            continue
+        in_local, in_visitor = local in tabla, visitor in tabla
+        if in_local and in_visitor:
+            seen.update((local, visitor))
+            outcomes = ((3, 0), (1, 1), (0, 3))
+            best_above += min(
+                int(score_after(local, dl) > best_target) + int(score_after(visitor, dv) > best_target)
+                for dl, dv in outcomes
+            )
+            worst_above += max(
+                int(score_after(local, dl) > worst_target) + int(score_after(visitor, dv) > worst_target)
+                for dl, dv in outcomes
+            )
+        elif in_local or in_visitor:
+            rival = local if in_local else visitor
+            seen.add(rival)
+            best_above += min(int(score_after(rival, add) > best_target) for add in (3, 1, 0))
+            worst_above += max(int(score_after(rival, add) > worst_target) for add in (3, 1, 0))
+    for rival in tabla:
+        if rival not in seen:
+            best_above += int(score_after(rival, 0) > best_target)
+            worst_above += int(score_after(rival, 0) > worst_target)
+    return best_above + 1, worst_above + 1
+
+def _pos_hoy(target, tabla, score_after):
+    x = score_after(target, 0)
+    return 1 + sum(1 for e in tabla if e != target and score_after(e, 0) > x)
+
+def _ord(p):
+    return f"{p}º"
+
+def lpf_previa_equipo_texto(equipo, Z, rest, pend, anual, prom, fecha=None):
+    """Previa de la próxima fecha PARA un equipo: cómo puede terminar la fecha
+    (mejor y peor puesto) en cada objetivo que le corresponde: playoffs (su zona),
+    copas (Tabla Anual) y descenso (Promedios y Anual). Todo exacto para una fecha."""
+    lab = lpf_zona_de_equipo(equipo, Z)
+    if not lab or equipo not in Z.get(lab, {}):
+        return None, None
+    fmap = _lpf_fecha_de(pend)
+    con = [(lv, f) for lv, f in fmap.items() if f is not None]
+    if not con:
+        return None, None
+    prox, _jg, _atr = lpf_jornada_actual(pend, forzar=fecha)
+    if prox is None:
+        return None, None
+    # El rango de puestos exige que cada equipo juegue A LO SUMO UNA VEZ (el cálculo es
+    # separable por partido). Si sumáramos la jornada + los postergados, un equipo que
+    # juega en las dos ventanas se contaría dos veces y el puesto se iría de rango.
+    games = list(_jg)
+    _dobles = []
+    _en_jornada = {x for lv in _jg for x in lv}
+    for lv, _f in _atr:
+        if lv[0] in _en_jornada or lv[1] in _en_jornada:
+            _dobles.append(lv)
+        else:
+            games.append(lv)
+    _etq = lpf_etiqueta_jornada(prox, _atr)
+    _atraso = lpf_equipos_con_atraso(pend)
+
+    L = [f"**Previa de la {_etq} para {equipo}** — cómo puede terminar la fecha."]
+    if _atr:
+        L.append(f"⚠️ Hay {len(_atr)} partido(s) postergado(s) de fechas anteriores en esta ventana.")
+    if _dobles:
+        _eqd = sorted({x for lv in _dobles for x in lv})
+        L.append(f"El rango de abajo cuenta **un partido por equipo**. Estos juegan dos veces en esta ventana "
+                 f"({', '.join(_eqd)}), así que pueden sumar hasta 3 puntos más de lo que refleja el rango.")
+    if _atraso.get(equipo):
+        L.append(f"⚠️ **{equipo} tiene {_atraso[equipo]} partido(s) pendiente(s) de fechas anteriores**: juega menos que el resto, "
+                 f"así que su posición en la tabla se lee con esa salvedad (puede sumar de más).")
+    mine = next((lv for lv in games if equipo in lv), None)
+    if mine:
+        l, v = mine; local = (l == equipo); rival = v if local else l
+        L.append(f"Juega **{'de local' if local else 'de visitante'} ante {rival}**.")
+    else:
+        L.append("Esta fecha no juega (o su partido ya está jugado); igual otros resultados pueden moverlo.")
+
+    filas = []
+    verdicts = []
+
+    # ── Playoffs (su zona; entran 8) ──
+    # Orden oficial: puntos, luego diferencia de gol, luego goles a favor.
+    base = Z[lab]
+    sz = lambda e, d: ((base[e]["pts"] + d, base[e].get("dg", 0), base[e].get("gf", 0))
+                       if e in base else (d, 0, 0))
+    hoy = _pos_hoy(equipo, set(base), sz)
+    b, w = _rango_puesto_fecha(equipo, set(base), sz, games)
+    filas.append({"Objetivo": f"Playoffs · Zona {lab} (entran 8)", "Hoy": _ord(hoy),
+                  "Mejor fin de fecha": _ord(b), "Peor fin de fecha": _ord(w)})
+    _techo_f = base[equipo]["pts"] + 3
+    if b > 1:
+        L.append(f"**Por qué no puede ser 1º esta fecha:** ganando llega a {_techo_f} puntos, y de los partidos entre "
+                 f"sus rivales salen inevitablemente **{b-1}** equipos por encima de ese número (en cada partido "
+                 f"alguien gana y suma 3, y hasta un equipo con pocos puntos lo pasa).")
+    if w <= 8:
+        verdicts.append(f"**Playoffs:** ya no podés salir de los 8 esta fecha (peor caso {_ord(w)}).")
+    elif b <= 8:
+        verdicts.append(f"**Playoffs:** podés meterte en zona de clasificación (hasta {_ord(b)}) o caer afuera (hasta {_ord(w)}).")
+    else:
+        verdicts.append(f"**Playoffs:** esta fecha no llegás a los 8 (tu mejor caso es {_ord(b)}).")
+
+    # ── Copas (Tabla Anual) si estás en la mitad de arriba ──
+    if anual and equipo in anual:
+        sa = lambda e, d: ((anual[e]["pts"] + d, anual[e].get("dg", 0), anual[e].get("gf", 0))
+                           if e in anual else (d, 0, 0))
+        hoy_a = _pos_hoy(equipo, set(anual), sa)
+        if hoy_a <= 14:
+            b2, w2 = _rango_puesto_fecha(equipo, set(anual), sa, games)
+            _emp = _empatados_en_tope(equipo, set(anual), lambda x: int(anual[x]["pts"]), games)
+            filas.append({"Objetivo": "Copas · Tabla Anual", "Hoy": _ord(hoy_a),
+                          "Mejor fin de fecha": _ord(b2), "Peor fin de fecha": _ord(w2)})
+            _extra = ""
+            if _emp:
+                _extra = (f" Ojo: el {_ord(b2)} sólo se da si quedás igualado en puntos con "
+                          f"{', '.join(_emp[:3])} y **ganás el desempate** (diferencia de gol y después los demás criterios); "
+                          f"si no, tu mejor realista es {_ord(b2 + len(_emp))}.")
+            verdicts.append(f"**Copas:** en la Anual podés terminar la fecha entre {_ord(b2)} y {_ord(w2)} "
+                            f"(cuanto más arriba, mejor plaza a Libertadores/Sudamericana).{_extra}")
+
+    # ── Descenso (Promedios y Anual) si estás abajo ──
+    if prom and equipo in prom:
+        sp = lambda e, d: ((prom[e][0] + d) / (prom[e][1] + 1), 0) if e in prom else (d, 0)
+        hoy_p = _pos_hoy(equipo, set(prom), sp)
+        if hoy_p >= len(prom) - 7:
+            b3, w3 = _rango_puesto_fecha_score(equipo, set(prom), sp, games)
+            filas.append({"Objetivo": f"Descenso · Promedios (baja el último, {len(prom)}º)",
+                          "Hoy": _ord(hoy_p), "Mejor fin de fecha": _ord(b3), "Peor fin de fecha": _ord(w3)})
+            zona_baja = w3 >= len(prom)
+            verdicts.append(f"**Descenso (promedios):** {'⚠️ en el peor caso quedás último y en zona de descenso' if zona_baja else 'esta fecha no caés al último puesto'} "
+                            f"(entre {_ord(b3)} y {_ord(w3)}).")
+    if anual and equipo in anual:
+        sa = lambda e, d: ((anual[e]["pts"] + d, anual[e].get("dg", 0), anual[e].get("gf", 0))
+                           if e in anual else (d, 0, 0))
+        hoy_a2 = _pos_hoy(equipo, set(anual), sa)
+        if hoy_a2 >= len(anual) - 6:
+            b4, w4 = _rango_puesto_fecha(equipo, set(anual), sa, games)
+            filas.append({"Objetivo": f"Descenso · Tabla Anual (baja el último, {len(anual)}º)",
+                          "Hoy": _ord(hoy_a2), "Mejor fin de fecha": _ord(b4), "Peor fin de fecha": _ord(w4)})
+
+    L.append(" ".join(verdicts))
+    L.append("_Rango exacto por puntos para esta fecha: combina tu resultado con el de los rivales y respeta que dos "
+             "equipos que se enfrentan no pueden sumar ambos de a tres. Si quedan igualados, el intervalo contempla "
+             "que el marcador cambia la DG y los GF; después rigen mano a mano, fair play y, eventualmente, sorteo. "
+             "Para saber qué hinchar en cada partido, preguntá "
+             f"«qué le conviene a {equipo}»._")
+    return "\n\n".join(L), pd.DataFrame(filas)
+
+
+def _lpf_ctx(Z, rest, apertura, camps, extras, prom, n_anual=1, n_prom=1):
+    """Precalcula todo lo estable para simular objetivos de la anual/promedios."""
+    anual = lpf_anual_base(Z, apertura or {})
+    P = lpf_plazas_copas(Z, apertura, camps or ("", "", ""), extras or ("", ""))
+    equipos = [e for b in Z.values() for e in b]
+    zona_de = {e: lab for lab, b in Z.items() for e in b}
+    zpts = {e: Z[zona_de[e]][e]["pts"] for e in equipos}
+    zdg = {e: Z[zona_de[e]][e].get("dg", 0) for e in equipos}
+    apts = {e: anual[e]["pts"] for e in equipos if e in anual}
+    adg = {e: anual[e].get("dg", 0) for e in equipos if e in anual}
+    return dict(Z=Z, anual=anual, reducida=P["reducida"], n_lib=P["n_tabla_lib"],
+                tomados=P["tomados"], orden=P["orden"], equipos=equipos, zona_de=zona_de,
+                zpts=zpts, zdg=zdg, apts=apts, adg=adg, prom=prom or {}, rest=rest,
+                n_anual=n_anual, n_prom=n_prom)
+
+def _sim_lpf_add(equipos, pend, s, n, seed, forced=None, pdraw=_LPF_PDRAW, loc=_LPF_LOCALIA):
+    """Matriz (n, len(equipos)) de puntos que suma cada equipo en los pendientes,
+    simulando todos los partidos reales del fixture. `forced`: {(l,v): 'L'|'E'|'V'}."""
+    rng = np.random.default_rng(seed)
+    idx = {e: i for i, e in enumerate(equipos)}
+    add = np.zeros((n, len(equipos)))
+    forced = forced or {}
+    for (a, b) in pend:
+        if a not in idx or b not in idx:
+            continue
+        ia, ib = idx[a], idx[b]; f = forced.get((a, b))
+        if f == "L": add[:, ia] += 3
+        elif f == "V": add[:, ib] += 3
+        elif f == "E": add[:, ia] += 1; add[:, ib] += 1
+        else:
+            pa = (1 - pdraw) * (s[a] * loc) / (s[a] * loc + s[b]); u = rng.random(n)
+            ga = u < pa; gb = u >= pa + pdraw
+            add[:, ia] += np.where(ga, 3, np.where(gb, 0, 1))
+            add[:, ib] += np.where(gb, 3, np.where(ga, 0, 1))
+    return add, idx
+
+def _rank_pos(key):
+    """Posición (1=mejor) por fila para una matriz de 'llaves' (mayor = mejor)."""
+    return (-key).argsort(1).argsort(1) + 1
+
+def _obj_bool(objetivo, X, add, idx, ctx):
+    """Array booleano (n,): en cada torneo simulado, ¿X logra el objetivo?"""
+    n = add.shape[0]
+    if objetivo == "playoffs":
+        lab = ctx["zona_de"].get(X)
+        if not lab:
+            return np.zeros(n, bool)
+        zt = list(ctx["Z"][lab])
+        # El epsilon estable representa los criterios todavía no cargados (fair play/sorteo)
+        # y evita que dos equipos ocupen a la vez la misma posición simulada.
+        eps = np.arange(len(zt), dtype=float) * 1e-8
+        key = np.array([ctx["zpts"][e] + ctx["zdg"][e] * 1e-4 for e in zt])[None, :] + eps + add[:, [idx[e] for e in zt]]
+        xj = zt.index(X)
+        return ((key > key[:, xj:xj + 1]).sum(1) + 1) <= 8
+    if objetivo in ("libertadores", "sudamericana"):
+        red = ctx["reducida"]
+        if X not in red:
+            return np.zeros(n, bool)
+        eps = np.arange(len(red), dtype=float) * 1e-8
+        key = np.array([ctx["apts"][e] + ctx["adg"][e] * 1e-4 for e in red])[None, :] + eps + add[:, [idx[e] for e in red]]
+        xj = red.index(X)
+        rank = (key > key[:, xj:xj + 1]).sum(1) + 1
+        if objetivo == "libertadores":
+            return rank <= ctx["n_lib"]
+        return (rank > ctx["n_lib"]) & (rank <= ctx["n_lib"] + 6)
+    if objetivo == "descenso":
+        prom = ctx["prom"]; rest = ctx["rest"]
+        pteams = [e for e in ctx["equipos"] if e in prom]
+        if pteams:
+            num = np.array([prom[e][0] for e in pteams], float)[None, :] + add[:, [idx[e] for e in pteams]]
+            den = np.array([prom[e][1] + rest.get(e, 0) for e in pteams], float)[None, :]
+            promedio = num / den
+            prom_last = np.array(pteams)[promedio.argmin(1)]
+        else:
+            prom_last = np.array([""] * n)
+        at = [e for e in ctx["equipos"] if e in ctx["apts"]]
+        eps = np.arange(len(at), dtype=float) * 1e-8
+        akey = np.array([ctx["apts"][e] + ctx["adg"][e] * 1e-4 for e in at])[None, :] + eps + add[:, [idx[e] for e in at]]
+        order = akey.argsort(1)  # ascendente: peor primero
+        anual_last = np.array(at)[order[:, 0]]
+        anual_2last = np.array(at)[order[:, 1]]
+        anual_releg = np.where(anual_last == prom_last, anual_2last, anual_last)
+        return (prom_last == X) | (anual_releg == X)
+    return np.zeros(n, bool)
+
+def _objetivo_lpf(q):
+    z = _zlow(q)
+    if "libertad" in z:
+        return "libertadores"
+    if "sudameric" in z:
+        return "sudamericana"
+    if any(w in z for w in ("descenso", "descender", "no descend", "salvar", "salvarse", "permanencia", "no bajar", "no se va")):
+        return "descenso"
+    if any(w in z for w in ("copa", "internacional")):
+        return "libertadores"
+    return "playoffs"
+
+_OBJ_NOMBRE = {"libertadores": "la Libertadores", "sudamericana": "la Sudamericana",
+               "descenso": "no descender", "playoffs": "los playoffs"}
+
+def _lpf_riesgo_descenso(X, ctx, margen=6):
+    """True si X está entre los últimos `margen` de promedios o de la anual (hoy)."""
+    prom = ctx["prom"]
+    if X in prom:
+        pr = sorted(prom, key=lambda e: prom[e][0] / prom[e][1])   # peor primero
+        if X in pr[:margen]:
+            return True, pr
+    at = sorted(ctx["apts"], key=lambda e: (ctx["apts"][e], ctx["adg"][e]))  # peor primero
+    return (X in at[:margen]), None
+
+def lpf_chances_obj(objetivo, ctx, pend, jugados, n=8000, seed=23, destacar=None):
+    """Tabla de probabilidades del objetivo para los equipos relevantes.
+    Devuelve (df, nota, titular) — titular resalta al equipo `destacar` si se pasa."""
+    eqs = ctx["equipos"]; base_all = {}
+    for b in ctx["Z"].values():
+        base_all.update(b)
+    s = _fuerza_lpf(base_all, jugados)
+    add, idx = _sim_lpf_add(eqs, pend, s, n, seed)
+    if objetivo in ("libertadores", "sudamericana"):
+        red = ctx["reducida"]
+        rows = []
+        sum_lib = sum_sud = 0.0
+        for e in red:
+            pl = _obj_bool("libertadores", e, add, idx, ctx).mean()
+            ps = _obj_bool("sudamericana", e, add, idx, ctx).mean()
+            sum_lib += float(pl); sum_sud += float(ps)
+            rows.append({"Equipo": e, "Anual": f"{ctx['orden'].index(e)+1}º",
+                         "Libertadores %": round(100 * pl), "Sudamericana %": round(100 * ps),
+                         "_k": pl if objetivo == "libertadores" else ps})
+        rows.sort(key=lambda r: -r["_k"])
+        if not np.isclose(sum_lib, ctx["n_lib"], atol=1e-10):
+            raise AssertionError(f"Invariante Libertadores rota: {sum_lib} != {ctx['n_lib']}")
+        if not np.isclose(sum_sud, min(6, max(0, len(red) - ctx["n_lib"])), atol=1e-10):
+            raise AssertionError(f"Invariante Sudamericana rota: {sum_sud} != 6")
+        df = pd.DataFrame([{k: v for k, v in r.items() if k != "_k"} for r in rows]).head(14)
+        df.attrs["mc_invariants"] = {"Libertadores": sum_lib, "Sudamericana": sum_sud}
+        _camps = [e for e in ctx["orden"] if e not in ctx["reducida"]]
+        _cnota = (f" No aparecen los que ya tienen plaza como campeones ({', '.join(_camps)}): liberan cupo y por eso "
+                  f"Libertadores se cuenta sobre esta tabla." if _camps else "")
+        nota = (f"Entran **{ctx['n_lib']}** a Libertadores por la tabla sin campeones y los **6** siguientes a Sudamericana.{_cnota} "
+                f"{NOTA_MC_LIGA}")
+        tit = ""
+        if destacar and destacar in red:
+            rr = next(r for r in rows if r["Equipo"] == destacar)
+            tit = f"**{destacar}:** {rr['Libertadores %']}% de entrar a la **Libertadores** y {rr['Sudamericana %']}% a la **Sudamericana**."
+        return df, nota, tit
+    if objetivo == "descenso":
+        rows = []
+        sum_desc = 0.0
+        for e in eqs:
+            pd_ = _obj_bool("descenso", e, add, idx, ctx).mean()
+            sum_desc += float(pd_)
+            rows.append({"Equipo": e, "En promedios": ("sí" if e in ctx["prom"] else "no"),
+                         "Prob. de descender %": round(100 * pd_), "_k": pd_})
+        rows.sort(key=lambda r: -r["_k"])
+        if ctx["prom"] and not np.isclose(sum_desc, 2.0, atol=1e-10):
+            raise AssertionError(f"Invariante descenso rota: {sum_desc} != 2")
+        df = pd.DataFrame([{k: v for k, v in r.items() if k != "_k"} for r in rows if r["_k"] >= 0.005]).head(10)
+        df.attrs["mc_invariants"] = {"Descensos": sum_desc}
+        nota = (f"Bajan **{ctx['n_anual']}** por la Anual y **{ctx['n_prom']}** por Promedios (con la regla de reasignación "
+                f"si coincide el último). {NOTA_MC_LIGA}")
+        tit = ""
+        if destacar:
+            rr = next((r for r in rows if r["Equipo"] == destacar), None)
+            if rr is not None:
+                tit = f"**{destacar}:** {rr['Prob. de descender %']}% de descender (⇒ {100-rr['Prob. de descender %']}% de salvarse)."
+        return df, nota, tit
+    return None, None, ""
+
+def lpf_conviene_obj(equipo, objetivo, ctx, pend, jugados, n=6000, seed=29, fecha=None):
+    """«La otra cancha» para un objetivo de la anual/promedios: qué resultado de la
+    próxima fecha le conviene a `equipo`, y además los CRUCES ENTRE SUS RIVALES en las
+    próximas fechas (no solo la de ya), rankeados por lo que le conviene. Todo por
+    simulación de la anual/promedios con el fixture real (contempla los cruces futuros).
+    Devuelve (texto, df_proxima, df_cruces)."""
+    eqs = ctx["equipos"]; base_all = {}
+    for b in ctx["Z"].values():
+        base_all.update(b)
+    s = _fuerza_lpf(base_all, jugados)
+    fmap = _lpf_fecha_de(pend)
+    con = [(lv, f) for lv, f in fmap.items() if f is not None]
+    if not con:
+        return None, None, None
+    prox, _jg, _atr = lpf_jornada_actual(pend, forzar=fecha)
+    if prox is None:
+        return None, None, None
+    juegos = [lv for lv in (list(_jg) + [x for x, _f in _atr]) if equipo not in lv]
+    salvar = (objetivo == "descenso")
+    def prob(forced):
+        add, idx = _sim_lpf_add(eqs, pend, s, n, seed, forced=forced)
+        p = _obj_bool(objetivo, equipo, add, idx, ctx).mean()
+        return (1 - p) * 100 if salvar else p * 100   # 'descenso' -> prob de SALVARSE
+    base_ch = prob(None)
+    UMBRAL = 1.0
+    ETQ = lambda l, v, k: {"L": f"que gane {l}", "E": "que empaten", "V": f"que gane {v}"}[k]
+    # (1) próxima fecha
+    rows = []
+    for (l, v) in juegos:
+        opts = {"L": prob({(l, v): "L"}), "E": prob({(l, v): "E"}), "V": prob({(l, v): "V"})}
+        best = max(opts, key=opts.get); worst = min(opts, key=opts.get); imp = opts[best] - opts[worst]
+        rows.append({"Partido": f"{l} – {v}", "Te conviene": ETQ(l, v, best) if imp >= UMBRAL else "da igual",
+                     "Te cambia": (f"{imp:.1f} pts" if imp >= UMBRAL else "—"), "_imp": imp})
+    rows.sort(key=lambda r: -r["_imp"])
+    df = pd.DataFrame([{"Partido": r["Partido"], "Te conviene": r["Te conviene"], "Te cambia": r["Te cambia"]} for r in rows]) if rows else None
+    # (2) cruces entre rivales, en TODAS las fechas que faltan
+    add0, idx0 = _sim_lpf_add(eqs, pend, s, n, seed)
+    universo = ctx["reducida"] if objetivo in ("libertadores", "sudamericana") else eqs
+    pobj = {e: _obj_bool(objetivo, e, add0, idx0, ctx).mean() for e in universo}
+    cont = [(e, p) for e, p in pobj.items() if 0.03 <= p <= 0.97 and e != equipo]
+    cont.sort(key=lambda ep: -min(ep[1], 1 - ep[1]))   # los más peleados primero
+    competidores = {e for e, _ in cont[:8]}
+    cruces = [((l, v), f) for (l, v), f in fmap.items() if f is not None and l in competidores and v in competidores]
+    cruces.sort(key=lambda c: c[1])   # fechas más próximas primero
+    cruces = cruces[:20]
+    crows = []
+    for (l, v), f in cruces:
+        opts = {"L": prob({(l, v): "L"}), "E": prob({(l, v): "E"}), "V": prob({(l, v): "V"})}
+        best = max(opts, key=opts.get); worst = min(opts, key=opts.get); imp = opts[best] - opts[worst]
+        if imp < UMBRAL:
+            continue
+        crows.append({"Fecha": f, "Partido": f"{l} – {v}", "Te conviene": ETQ(l, v, best), "Te cambia": f"{imp:.1f} pts", "_imp": imp})
+    crows.sort(key=lambda r: -r["_imp"])
+    df_cruces = pd.DataFrame([{k: v for k, v in r.items() if k != "_imp"} for r in crows[:8]]) if crows else None
+    # texto
+    meta = "salvarte del descenso" if salvar else f"entrar a {_OBJ_NOMBRE[objetivo]}"
+    L = [f"**La otra cancha para {equipo}** — mirando **{meta}**. Hoy tu chance es **{round(base_ch)}%**."]
+    top1 = rows[0] if rows else None
+    if top1 and top1["_imp"] >= UMBRAL:
+        L.append(f"En la Fecha {prox}, el que más te mueve es **{top1['Partido']}**: te conviene **{top1['Te conviene']}** ({top1['Te cambia']}).")
+    else:
+        L.append(f"En la Fecha {prox}, los partidos de tus rivales casi no te mueven la aguja: depende más de lo tuyo.")
+    if df_cruces is not None:
+        L.append(f"Abajo, los **cruces entre tus rivales directos por {_OBJ_NOMBRE[objetivo]}** en las próximas fechas que más te convienen (cuando dos que pelean tu lugar se enfrentan, uno cede puntos).")
+    else:
+        L.append("Por ahora ningún cruce entre tus rivales te mueve la aguja de forma clara (estás lejos o falta mucho); se vuelve decisivo cuando la tabla se aprieta.")
+    L.append("_Estimación por simulación de la Tabla Anual/Promedios con el fixture real (contempla los cruces futuros entre rivales). Rotulada como estimación._")
+    return "\n\n".join(L), df, df_cruces
+
+
+def _router_lpf(acc, E):
+    intent = acc.get("intent"); q = acc.get("q", "")
+    Z = E.get("zonas_lpf") or {}; rest = E.get("rest") or {}
+    ap = E.get("apertura") or {}; pend = E.get("pendientes") or []
+    eqs = E.get("equipos") or []
+    jugados = E.get("jugados") or []
+    equipo = acc.get("equipo")
+    if equipo and equipo not in eqs:
+        equipo = detectar_equipo(equipo, eqs) or equipo
+    c1, c2, c3 = (E.get("camps") or ("", "", ""))
+    na, npro = int(E.get("n_anual", 1)), int(E.get("n_prom", 1))
+    prev = st.session_state.get("PROMEDIOS") or {}
+    anual = lpf_anual_base(Z, ap)
+
+    if intent in ("octavos", "cruces", "duelos", "camino"):
+        return [("md", lpf_cruces_texto(Z))]
+    xl, xs = (E.get("intl") or ("", ""))
+    if intent == "copas" and not E.get("anual_directo"):
+        return [("warning", "Para las copas necesito la **Tabla Anual real**. Tocá «📦 Cargar Tabla Anual + Promedios» en el panel.")]
+    if intent == "copas":
+        if equipo:
+            return [("md", lpf_copas_necesita_texto(equipo, Z, rest, ap, (c1, c2, c3), (xl, xs), pend)),
+                    ("df", lpf_anual_df(Z, ap), "Tabla General 2026")]
+        return [("md", lpf_copas_texto(Z, ap, c1, c2, c3, xl, xs)),
+                ("df", lpf_anual_df(Z, ap), "Tabla General 2026 (Apertura + Clausura)")]
+    if intent == "anual":
+        out = [("df", lpf_anual_df(Z, ap), "Tabla General 2026 (art. 24.1)")]
+        if not E.get("anual_directo"):
+            out.insert(0, ("warning", "⚠️ Esto **no es la anual real**: es solo el Clausura. "
+                                      "Tocá «📦 Cargar Tabla Anual + Promedios» en el panel para sumarle el Apertura."))
+        out.append(("md", "_El 1º de esta tabla es el **Campeón de Liga 2026** (art. 24.2)._"))
+        return out
+    if intent in ("promedios", "descenso"):
+        out = [("md", lpf_descenso_texto(Z, rest, ap, prev, na, npro, equipo, pend))]
+        out.append(("df", promedios_df(anual, rest, prev), "Promedios (piso = perdiendo todo · techo = ganando todo)"))
+        out.append(("df", lpf_anual_df(Z, ap), "Tabla General 2026"))
+        return out
+    if intent == "estado_fecha":
+        return [("md", lpf_estado_fecha_texto(Z))]
+    if intent == "actualizado":
+        t, ok = lpf_estado_datos(Z)
+        return [("success" if ok else "warning", t)]
+    if intent in ("tabla", "hoy", "zonas", "panorama"):
+        t, ok = lpf_estado_datos(Z)
+        out = [("md", lpf_tabla_zonas_texto(Z))]
+        if not ok:
+            out.insert(0, ("warning", t))
+        return out
+    if intent == "conviene":
+        if not equipo:
+            return [("warning", "Decime el equipo. Ej.: «qué le conviene a River» o «qué le conviene a River para la Libertadores».")]
+        obj = _objetivo_lpf(q)
+        if obj == "playoffs":
+            txt, dfc = lpf_otros_resultados_sim(equipo, Z, rest, pend, jugados=jugados)
+            if dfc is None:
+                return [("info", f"En la próxima fecha no hay partidos de rivales de zona de {equipo} que le muevan la tabla "
+                                 f"(o {equipo} no está en zona de playoffs).")]
+            return [("md", txt), ("df", dfc, f"{equipo}: qué te conviene en la otra cancha (playoffs)")]
+        ctx = _lpf_ctx(Z, rest, ap, (c1, c2, c3), (xl, xs), prev, na, npro)
+        if obj in ("libertadores", "sudamericana") and equipo not in ctx["reducida"]:
+            return [("info", f"{equipo} no está en la tabla que reparte copas por la anual (o ya tiene plaza como campeón).")]
+        if obj == "descenso":
+            if not prev:
+                return [("info", "Para el descenso necesito los **promedios** cargados. Tocá «📥 Cargar TODO».")]
+            riesgo, _ = _lpf_riesgo_descenso(equipo, ctx)
+            if not riesgo:
+                return [("info", f"{equipo} no está en zona de riesgo: no aparece entre los últimos 6 de promedios ni de la anual, "
+                                 f"así que no calculo el descenso para él (podés pedir sus **chances de Libertadores/Sudamericana** o sus **playoffs**).")]
+        txt, dfc, dfx = lpf_conviene_obj(equipo, obj, ctx, pend, jugados)
+        if txt is None:
+            return [("info", "No hay partidos pendientes para analizar la otra cancha.")]
+        out = [("md", txt)]
+        if dfc is not None:
+            out.append(("df", dfc, f"{equipo}: la próxima fecha para {_OBJ_NOMBRE[obj]}"))
+        if dfx is not None:
+            out.append(("df", dfx, f"{equipo}: cruces entre tus rivales que más te convienen"))
+        return out
+    if intent in ("playoffs", "necesita", "numero_magico", "puesto_exacto", "chances", "depende"):
+        if not equipo:
+            return [("warning", "Decime el equipo. Ej.: «qué necesita River para los playoffs».")]
+        qn = _zlow(q)
+        if any(w in qn for w in ("descenso", "descender", "promedio", "bajar", "salvar", "permanencia")):
+            return [("md", lpf_descenso_texto(Z, rest, ap, prev, na, npro, equipo, pend))]
+        if any(w in qn for w in ("libertadores", "sudamericana", "copa")):
+            return [("md", lpf_copas_necesita_texto(equipo, Z, rest, ap, (c1, c2, c3), (xl, xs), pend))]
+        lab = lpf_zona_de_equipo(equipo, Z)
+        out = [("md", lpf_playoffs_texto(equipo, Z, rest, pend))]
+        if lab:
+            out.append(("df", liga_maxmin_df(Z[lab], rest), f"Zona {lab}: puntos máximos posibles"))
+        return out
+    if intent == "proyeccion":
+        base_all = {}
+        for b in Z.values(): base_all.update(b)
+        return [("df", liga_proyeccion_df(base_all, rest), "Proyección del Clausura si cada uno mantiene su ritmo"),
+                ("md", "_Puntos de hoy + puntos por partido × fechas que faltan._")]
+    if intent in ("probabilidades", "chances_zona"):
+        obj = _objetivo_lpf(q)
+        if obj == "playoffs":
+            out = []
+            for lab in sorted(Z):
+                out.append(("df", liga_probabilidades_df(Z[lab], rest, pend, LPF_ZONAS_PLAYOFF,
+                                                          fuerza=_fuerza_lpf(Z[lab], jugados)),
+                            f"Zona {lab}: chances de entrar a los playoffs (simulación)"))
+            out.append(("md", NOTA_MC_LIGA))
+            return out
+        if obj == "descenso" and not prev:
+            return [("info", "Para las chances de descenso necesito los **promedios** cargados. Tocá «📥 Cargar TODO».")]
+        ctx = _lpf_ctx(Z, rest, ap, (c1, c2, c3), (xl, xs), prev, na, npro)
+        df, nota, tit = lpf_chances_obj(obj, ctx, pend, jugados, destacar=equipo)
+        if df is None:
+            return [("info", "No pude calcular esas chances.")]
+        titulo = {"libertadores": "Chances de Libertadores y Sudamericana (por la anual)",
+                  "sudamericana": "Chances de Sudamericana y Libertadores (por la anual)",
+                  "descenso": "Chances de descenso"}[obj]
+        out = []
+        if tit:
+            out.append(("md", tit))
+        out.append(("df", df, titulo))
+        out.append(("md", nota))
+        return out
+    if intent == "comparar":
+        e2 = acc.get("equipo2")
+        if e2 and e2 not in eqs:
+            e2 = detectar_equipo(e2, eqs)
+        if not equipo or not e2:
+            return [("warning", "Decime los dos equipos. Ej.: «comparar River y Boca».")]
+        la, lb = lpf_zona_de_equipo(equipo, Z), lpf_zona_de_equipo(e2, Z)
+        base_all = {}
+        for b in Z.values(): base_all.update(b)
+        out = [("df", liga_comparar_df(equipo, e2, base_all, rest, LPF_ZONAS_PLAYOFF), f"{equipo} (Zona {la}) vs {e2} (Zona {lb})")]
+        if la != lb:
+            out.append(("info", "Ojo: están en zonas distintas, así que compiten por lugares distintos."))
+        return out
+    if intent == "relato":
+        if equipo:
+            lab = lpf_zona_de_equipo(equipo, Z)
+            return [("md", lpf_relato_zona_texto(Z, lab, rest))] if lab else [("warning", f"No encuentro a {equipo}.")]
+        return [("md", lpf_relato_zona_texto(Z, l, rest)) for l in sorted(Z)]
+    if intent in ("previa", "juega"):
+        if equipo and intent == "previa":
+            txt, dfe = lpf_previa_equipo_texto(equipo, Z, rest, pend, anual, prev)
+            if dfe is not None:
+                return [("md", txt), ("df", dfe, f"{equipo}: cómo puede terminar la Fecha")]
+        fx, dfp = lpf_previa_fecha_sim(Z, rest, pend, jugados)
+        if dfp is None:
+            return [("info", "No me quedan partidos pendientes para armar la previa.")]
+        return [("df", dfp, f"Previa de la Fecha {fx} — probabilidad estimada de cada partido"),
+                ("md", "_Estimación del modelo (fuerza por puntos + forma reciente si hay resultados + ventaja de localía). No es un pronóstico: no ve lesiones ni bajas._")]
+    if intent in ("arbol", "bisagra", "simulador"):
+        if not equipo:
+            return [("warning", "Decime el equipo. Ej.: «árbol de River» o «partido bisagra de Boca».")]
+        txt, dfa = lpf_arbol_sim(equipo, Z, rest, pend, jugados=jugados)
+        if dfa is None:
+            return [("info", f"No tengo partidos pendientes de {equipo} para armar el árbol.")]
+        return [("md", txt), ("df", dfa, f"{equipo}: chances de octavos según el próximo resultado")]
+    if intent in ("forma",):
+        if not jugados:
+            return [("info", "Todavía no hay resultados partido a partido cargados. En el panel, abrí "
+                             "**🛠️ Otras formas de cargar → 🥅 Resultados partido a partido**, tocá «Traer resultados LPF 2026» "
+                             "(o pegá los tuyos) y volvé a cargar. Con eso se activan forma, rachas y local/visitante.")]
+        _poco = max((_stats(eqs, jugados)[e]["pj"] for e in eqs), default=0) <= 1
+        if equipo:
+            lab = lpf_zona_de_equipo(equipo, Z)
+            ult, p5 = forma_equipo(equipo, jugados, 5)
+            L = [f"**Forma de {equipo}**",
+                 f"Últimos {len(ult) or 0}: **{''.join(ult) or '—'}** ({p5} pts) · Racha: **{racha_equipo(equipo, jugados)}**."]
+            if _poco:
+                L.append("_Con una sola fecha jugada, la forma todavía dice poco._")
+            out = [("md", "\n\n".join(L))]
+            if lab:
+                out.append(("df", local_visitante_df(Z[lab], jugados), f"Zona {lab}: rendimiento local/visitante"))
+            return out
+        out = [("df", _lpf_forma_zona_df(Z[lab], jugados), f"Zona {lab}: forma (últimos 5) y racha") for lab in sorted(Z)]
+        if _poco:
+            out.append(("md", "_Con una sola fecha jugada, la forma todavía dice poco; se afina fecha a fecha._"))
+        return out
+    if intent in ("localia", "local_visitante"):
+        if not jugados:
+            return [("info", "Necesito los resultados partido a partido. En el panel: **🛠️ Otras formas de cargar → "
+                             "🥅 Resultados partido a partido**, y volvé a cargar.")]
+        if equipo:
+            lab = lpf_zona_de_equipo(equipo, Z)
+            return [("df", local_visitante_df(Z.get(lab, {}), jugados), f"Zona {lab}: local/visitante")]
+        return [("df", local_visitante_df(Z[lab], jugados), f"Zona {lab}: local/visitante") for lab in sorted(Z)]
+    if intent in ("visual", "mapa", "barras", "puesto"):
+        out = []
+        for lab in sorted(Z):
+            out.append(("df", liga_probabilidades_df(Z[lab], rest, pend, LPF_ZONAS_PLAYOFF,
+                                                      fuerza=_fuerza_lpf(Z[lab], jugados)),
+                        f"Zona {lab}: chances de entrar a los playoffs (simulación)"))
+        out.append(("md", NOTA_MC_LIGA))
+        return out
+    if intent == "maximos":
+        dfs = []
+        for lab in sorted(Z):
+            dfs.append(("df", liga_maxmin_df(Z[lab], rest), f"Zona {lab}"))
+        return dfs or [("info", "Cargá las zonas.")]
+    if intent == "calendario":
+        if not pend:
+            return [("info", "Para la dificultad del calendario pegá el **fixture** («River vs Boca»), no solo «faltan N fechas».")]
+        ppg = {e: (anual[e]["pts"] / anual[e]["pj"]) if anual[e].get("pj") else 0.0 for e in anual}
+        return [("df", dificultad_fixture_df(eqs, pend, ppg, rest), "Dificultad del fixture restante")]
+    if intent == "ficha":
+        if not equipo:
+            return [("warning", "¿De qué equipo? Ej.: «ficha de River».")]
+        lab = lpf_zona_de_equipo(equipo, Z)
+        base = Z.get(lab, {})
+        return [("md", ficha_liga_texto(equipo, base, rest, pend, LPF_ZONAS_PLAYOFF) if base else f"No encuentro a {equipo}.")]
+    return [("md", AYUDA_LPF)]
+
+
+AYUDA_LPF = """### ⚽ Calculadora LPF 2026 — guía de uso
+
+**Cómo cargar y actualizar los datos**
+1. Botón grande **«📥 Cargar TODO»** — trae de una las dos zonas, la Tabla Anual, los promedios, el fixture de las 16 fechas y los resultados de la fecha 1 (datos internos, sirve sin internet).
+2. **«🔄 Actualizar a hoy (ESPN)»** — una vez por fecha: baja las tablas con los PJ del día **y** los resultados partido a partido (para forma y rachas). Si ESPN no separa las zonas, caés al pegado manual.
+3. En **«🛠️ Otras formas de cargar»**: pegar las tablas de Promiedos, editar el histórico, y **«🥅 Resultados partido a partido»** para pegar/actualizar marcadores a mano.
+4. La app te avisa sola si los datos quedaron viejos o si hay una fecha en curso.
+
+---
+
+### 🏆 Playoffs (entran los 8 primeros de cada zona)
+- **¿Qué necesita River para los playoffs?** — la cuenta con el **piso seguro**, los **mano a mano**, las **opciones** (con cuánto entrás si les ganás a los de arriba, o terminando por encima de tal rival) y el «🔍 por qué»
+- **Tabla** — las dos zonas con la línea de clasificación · **Octavos** — los 8 cruces si terminara hoy
+- **Relato de la zona** — el panorama escrito, listo para la nota
+- **Probabilidades** (o «chances de River») — % de entrar a los playoffs por simulación
+- **Proyección** — con cuántos puntos termina cada uno si mantiene el ritmo
+- _También:_ ¿quién clasifica hoy? · ¿está eliminado X? · máximos
+
+### 📉 Descenso (bajan 2: uno por promedios y otro por la anual)
+- **Descenso** — quiénes se irían hoy por cada tabla, con la regla si el mismo es último en las dos
+- **¿Se salva Aldosivi?** — exacto por promedio y por anual, con piso, techo y **opciones** (mano a mano incluido)
+- **Chances de Aldosivi para el descenso** — probabilidad de descender/salvarse por simulación (solo para equipos entre los últimos 6 de promedios o de la anual)
+- **¿Qué le conviene a Aldosivi para salvarse?** — qué resultado de la otra cancha lo aleja del descenso
+- **Promedios** — la tabla completa con PROMEDIO, piso y techo
+- _También:_ ¿quién se salva? · ¿quién está en riesgo? · zona de descenso
+
+### 🌎 Copas 2027 (siempre primero la Libertadores)
+- **Copas** — cómo quedan las plazas de Libertadores y Sudamericana
+- **¿River llega a la Libertadores?** — tu puesto en la tabla **sin campeones**, con piso y **opciones**
+- **Chances de River para la Libertadores** / **para la Sudamericana** — probabilidad por simulación (tabla de la anual sin campeones), cada copa por separado
+- **¿Qué le conviene a River para la Libertadores?** (o para la Sudamericana) — qué hinchar en la otra cancha para esa copa
+- **Anual** — la Tabla General 2026 (su 1º es Campeón de Liga)
+- _También:_ ¿quiénes van a la Sudamericana?
+
+### 🎯 Previa y escenarios por equipo
+- **Previa de River** (o «cómo puede terminar la fecha para River») — su partido y **entre qué puestos puede terminar la fecha**, en playoffs, copas y/o descenso según le corresponda. Rango **exacto** para la fecha.
+- **¿Qué le conviene a River?** (o «la otra cancha», «para quién hinchar») — qué resultado de cada partido de sus rivales le sirve, por simulación. Por defecto para playoffs; agregá **«para la Libertadores»**, **«para la Sudamericana»** o **«para salvarse»** según el objetivo.
+- **Árbol de River** — cómo cambian sus chances según gane, empate o pierda el próximo; marca el **partido bisagra**
+- **Previa de la fecha** — probabilidad estimada de cada partido de la próxima fecha (todos los partidos)
+
+### 🔎 Por equipo
+- **Ficha de River** — puesto, ritmo, DG, rivales que le quedan y dificultad
+- **Forma de River** / **racha de Boca** — los últimos 5 y la racha (requiere resultados cargados)
+- **De local y de visitante** — rendimiento por condición
+- **Comparar River y Boca** — cara a cara · **Calendario** — qué tan bravo es el fixture · **¿Contra quién juega River?**
+
+### 🔴 Control de datos
+- **Estado de la fecha** — quién ya jugó y está tomado, y los partidos de estos días (en vivo desde ESPN)
+- **¿Está actualizado?** — compara lo cargado con el calendario oficial
+- Después de casi cualquier respuesta: **¿por qué?** — te desarma la cuenta paso a paso
+
+---
+
+_Todo se calcula en Python con los datos cargados: los veredictos («ya está», «quedó afuera», puntos que faltan, mejor/peor puesto de la fecha) son **exactos**, y lo que es estimación (probabilidades, árbol, qué conviene, previa por partido) va siempre rotulado como tal. Nada lo escribe una IA por su cuenta._
+
+_El piso es una **cota segura** que ya descuenta los mano a mano. El árbol, las chances y «qué conviene» son **por simulación** (no enumeran marcador por marcador); cuando quedan pocas fechas, se vuelven prácticamente exactos. La previa por equipo (mejor/peor puesto) es exacta para la fecha._"""
+
+
+def _router_liga_tabla(acc, E):
+    intent = acc.get("intent"); equipo = acc.get("equipo"); q = acc.get("q", "")
+    base, rest = E["base"], E["rest"]; eqs = E["equipos"]
+    z = st.session_state.get("ZONAS") or []
+    if equipo and equipo not in eqs:
+        equipo = detectar_equipo(equipo, eqs)
+    # En modo liga «libertadores/descenso/playoffs» suelen ser NOMBRES DE ZONA, no intents LPF
+    if intent in ("copas", "descenso", "playoffs"):
+        intent = "necesita" if equipo else "zonas"
+    elif intent in ("anual", "octavos"):
+        intent = "tabla"
+    if intent == "ayuda":
+        return [("md", AYUDA_LIGA)]
+    if intent in ("tabla", "hoy", "panorama"):
+        out = []
+        if z:
+            out.append(_placa(spec_zonas_df(liga_tabla_df(base), z), "tabla_zonas.png"))
+            out.append(("md", tabla_zonas_texto_df(liga_tabla_df(base), z)))
+        else:
+            out.append(("df", liga_tabla_df(base), "Tabla actual"))
+        return out
+    if intent == "zonas":
+        if not z:
+            return [("info", "Configurá las zonas en «🎨 Zonas con nombre» (panel) y volvé a preguntar.")]
+        return [_placa(spec_zonas_df(liga_tabla_df(base), z), "tabla_zonas.png"),
+                ("md", tabla_zonas_texto_df(liga_tabla_df(base), z))]
+    if intent == "maximos":
+        return [("df", liga_maxmin_df(base, rest), "Puntos máximos posibles")]
+    if intent in ("probabilidades", "chances"):
+        df = liga_probabilidades_df(base, rest, E["pendientes"], z)
+        out = []
+        if equipo:
+            fila = df[df["Equipo"] == equipo]
+            if len(fila):
+                partes = [f"{c.replace(' %','')}: {fila[c].iloc[0]}%" for c in df.columns if c.endswith("%")]
+                out.append(("md", f"**¿Cómo viene {equipo}?** (simulación) → " + " · ".join(partes)))
+        out += [("df", df, "Chances por zona (cada 100 torneos simulados)"), ("md", NOTA_MC_LIGA)]
+        return out
+    if intent == "promedios":
+        prevP = st.session_state.get("PROMEDIOS") or {}
+        kk = int(st.session_state.get("PROM_K", 1))
+        if equipo:
+            return [("md", promedio_que_necesita_texto(equipo, base, rest, prevP, kk)),
+                    ("df", promedios_df(base, rest, prevP), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)")]
+        return [("df", promedios_df(base, rest, prevP), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)"),
+                ("md", "_«Solo actual» = sin temporadas previas cargadas (recién ascendidos: es la regla). "
+                       "Cargá las previas en el panel «📉 Promedios» y pedí «promedio de X» para el análisis._")]
+    if intent == "terceros":
+        return [("info", "Ese tablero es para torneos por grupos. En modo liga usá zonas, promedios o chances.")]
+    if intent == "ficha":
+        if not equipo:
+            return [("warning", "¿De qué equipo? Ej.: «ficha de River».")]
+        return [("md", ficha_liga_texto(equipo, base, rest, E["pendientes"], z))]
+    if intent == "calendario":
+        if not E["pendientes"]:
+            return [("info", "Para la dificultad del calendario necesito el **fixture** (pegá los partidos «A vs B» en el panel).")]
+        ppg = {e: (base[e]["pts"] / base[e].get("pj", 1)) if base[e].get("pj") else 0.0 for e in base}
+        return [("df", dificultad_fixture_df(eqs, E["pendientes"], ppg, rest), "Dificultad del fixture restante"),
+                ("md", "_«Dificultad» = promedio de puntos por partido de los rivales que le quedan a cada uno: cuanto más alto, más bravo el calendario._")]
+    if intent in ("forma", "localia"):
+        jugE = E.get("jugados") or []
+        if not jugE:
+            return [("info", "Para **forma** y **local/visitante** necesito los resultados partido a partido: "
+                             "usá «Leer TODO» desde la URL de Wikipedia, importá el JSON del actor o pegá los resultados. "
+                             "Con la tabla sola no puedo reconstruirlos.")]
+        if intent == "localia":
+            return [("df", local_visitante_df(eqs, jugE), "Rendimiento como local y como visitante")]
+        out = []
+        if equipo:
+            ult, p5 = forma_equipo(equipo, jugE)
+            out.append(("md", f"**{equipo}** viene {''.join(ult) or '—'} ({p5} pts en los últimos {len(ult)}) · racha: {racha_equipo(equipo, jugE)}."))
+        out.append(("df", tabla_forma_df(eqs, jugE), "Tabla de forma (últimos 5: G/E/P)"))
+        return out
+    if intent == "proyeccion":
+        return [("df", liga_proyeccion_df(base, rest), "Proyección a fin de torneo si cada uno mantiene su ritmo"),
+                ("md", "_«Proyección (ritmo)» = puntos actuales + puntos por partido × partidos que restan. "
+                       "Es la vara clásica para la nota; el techo es ganando todo._")]
+    if intent == "comparar":
+        e2 = acc.get("equipo2")
+        if e2 and e2 not in eqs:
+            e2 = detectar_equipo(e2, eqs)
+        if not equipo or not e2:
+            return [("warning", "Decime los dos equipos. Ej.: «comparar River y Boca».")]
+        return [("df", liga_comparar_df(equipo, e2, base, rest, z), f"{equipo} vs {e2}")]
+    if intent == "asegurados":
+        nn = acc.get("n") or DIRECTO()
+        return [("df", liga_aseg_df(base, rest, nn), f"Asegurados / sin chances (top {nn})")]
+    if intent in ("duelos", "cruces"):
+        return [("md", liga_duelos_texto(base, rest, E["pendientes"], z))]
+    if intent in ("necesita", "numero_magico", "puesto_exacto", "conviene", "depende"):
+        if not equipo:
+            return [("warning", "Decime el equipo. Ej.: «qué necesita River para Libertadores».")]
+        return [("md", liga_que_necesita_texto(equipo, base, rest, z, q, E["pendientes"])),
+                ("df", liga_maxmin_df(base, rest), "Puntos máximos posibles")]
+    if intent == "relato":
+        if not equipo:
+            return [("info", "En modo liga, contame el equipo y la zona. Ej.: «qué necesita River para Libertadores».")]
+        return [("md", liga_que_necesita_texto(equipo, base, rest, z, q or "", E["pendientes"])),
+                ("df", liga_maxmin_df(base, rest), "Puntos máximos posibles")]
+    return [("info", "Cargaste una **liga por tabla**. Probá: «tabla por zonas», «qué necesita River para Libertadores», "
+                     "«máximos», «asegurados top 4». (Para escenarios marcador-a-marcador, cargá un grupo por resultados.)")]
+
+
+def _explicar_porque(E):
+    u = st.session_state.get("ULTIMO") or {}
+    equipo = u.get("equipo"); q = u.get("q", ""); intent = u.get("intent")
+    if E.get("modo") == "liga_tabla":
+        base, rest = E["base"], E["rest"]; z = st.session_state.get("ZONAS") or []
+        if equipo:
+            eq = detectar_equipo(equipo, E["equipos"]) or equipo
+            r = _porque_liga(eq, base, rest, z, q)
+            if r:
+                return [("md", "🔍 **Por qué:** " + r)]
+        return [("info", "Preguntá algo concreto (ej.: «qué necesita River para Libertadores») y después «¿por qué?».")]
+    eqs, jug, pen, esc = E["equipos"], E["jugados"], E["pendientes"], E["esc"]
+    if esc is None:
+        if equipo:
+            nn = 1 if u.get("objetivo") == "campeon" else (u.get("n") or DIRECTO())
+            return [("md", "🔍 **Por qué:** " + _porque_numero_magico(detectar_equipo(equipo, eqs) or equipo, eqs, jug, pen, nn))]
+        return [("info", "Preguntá «número mágico de X» o «qué necesita X» y después «¿por qué?».")]
+    if intent == "bisagra":
+        r = _porque_bisagra(eqs, jug, pen, esc)
+        return [("md", "🔍 **Por qué:** " + r)] if r else [("info", "No quedan partidos para analizar.")]
+    if equipo:
+        eq = detectar_equipo(equipo, eqs) or equipo
+        nn = u.get("n") or DIRECTO()
+        return [("md", "🔍 **Por qué:** " + _porque_pasar(eq, eqs, jug, esc, pen, nn))]
+    return [("info", "Preguntá algo concreto (ej.: «cómo viene River», «qué necesita River», «partido bisagra») y después «¿por qué?».")]
+
+
+def ejecutar_accion(acc):
+    intent = acc.get("intent")
+    equipo = acc.get("equipo")
+    objetivo = acc.get("objetivo")
+    n = acc.get("n")
+    E = st.session_state.ESTADO
+
+    if intent == "porque":
+        return _explicar_porque(E)
+
+    # ── MODO LPF 2026 (zonas A/B + anual + promedios + copas) ──
+    if E.get("modo") == "lpf2026":
+        return _router_lpf(acc, E)
+
+    # ── MODO LIGA POR TABLA (pegaste tabla + fechas) ──
+    if E.get("modo") == "liga_tabla":
+        return _router_liga_tabla(acc, E)
+
+    eqs, jug, pen, esc = E["equipos"], E["jugados"], E["pendientes"], E["esc"]
+    if equipo and equipo not in eqs:
+        equipo = detectar_equipo(equipo, eqs)
+
+    # ── TABLA POR ZONAS (sirve por puntos; ideal para ligas) ──
+    if intent == "zonas":
+        z = st.session_state.get("ZONAS") or []
+        if not z:
+            return [("info", "Todavía no configuraste zonas. Abrí «🎨 Zonas con nombre» en el panel y elegí un preset (ej.: Liga Argentina), o escribí las tuyas.")]
+        return [_placa(spec_zonas(eqs, jug, z), "tabla_zonas.png"), ("md", tabla_zonas_texto(eqs, jug, z))]
+
+    if intent == "ficha":
+        if not equipo:
+            return [("warning", "¿De qué equipo? Ej.: «ficha de River».")]
+        return [("md", ficha_equipo_texto(equipo, eqs, jug, pen))]
+    if intent == "forma":
+        out = []
+        if equipo:
+            ult, p5 = forma_equipo(equipo, jug)
+            out.append(("md", f"**{equipo}** viene {''.join(ult) or '—'} ({p5} pts en los últimos {len(ult)}) · racha: {racha_equipo(equipo, jug)}."))
+        out.append(("df", tabla_forma_df(eqs, jug), "Tabla de forma (últimos 5: G/E/P)"))
+        return out
+    if intent == "localia":
+        return [("df", local_visitante_df(eqs, jug), "Rendimiento como local y como visitante")]
+    if intent == "calendario":
+        if not pen:
+            return [("info", "No quedan partidos por jugar.")]
+        ovx = _stats(eqs, jug); ppg = {e: (ovx[e]["pts"] / ovx[e]["pj"]) if ovx[e]["pj"] else 0.0 for e in eqs}
+        return [("df", dificultad_fixture_df(eqs, pen, ppg), "Dificultad del fixture restante"),
+                ("md", "_«Dificultad» = promedio de puntos por partido de los rivales que quedan: cuanto más alto, más bravo._")]
+
+    if intent == "promedios":
+        ovx = _stats(eqs, jug); restx = _restantes(eqs, pen)
+        basex = {e: {"pts": ovx[e]["pts"], "pj": ovx[e]["pj"], "dg": ovx[e]["dg"]} for e in eqs}
+        prev = st.session_state.get("PROMEDIOS") or {}
+        kk = int(st.session_state.get("PROM_K", 1))
+        if equipo:
+            return [("md", promedio_que_necesita_texto(equipo, basex, restx, prev, kk)),
+                    ("df", promedios_df(basex, restx, prev), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)")]
+        return [("df", promedios_df(basex, restx, prev), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)"),
+                ("md", "_«Solo actual» = sin temporadas previas cargadas (recién ascendidos: es la regla). "
+                       "Cargá las previas en el panel «📉 Promedios» y pedí «promedio de X» para el análisis._")]
+
+    # ── MODO LIGA (por puntos): cuando hay demasiados partidos para enumerar ──
+    if esc is None:
+        if intent == "ayuda":
+            return [("md", AYUDA_LIGA)]
+        if intent == "tabla":
+            return [("df", tabla(eqs, jug), "Tabla actual"), ("md", si_terminara_hoy_texto(eqs, jug, pen))]
+        if intent in ("hoy", "panorama"):
+            return [("md", si_terminara_hoy_texto(eqs, jug, pen)), ("df", tabla(eqs, jug), "Tabla actual")]
+        if intent == "maximos":
+            return [("df", maximos_minimos(eqs, jug, pen), "Puntos máximos posibles")]
+        if intent == "asegurados":
+            nn = n or DIRECTO()
+            return [("df", clasificado_eliminado(eqs, jug, pen, nn), f"Asegurados / sin chances (top {nn})")]
+        if intent == "probabilidades":
+            return [("md", "Estimación por simulación (Poisson, 8.000 sorteos) con **fuerza estimada** por el rendimiento de cada equipo."),
+                    ("df", probabilidades(eqs, jug, pen, fuerza=fuerza_desde_stats(eqs, jug)), "Probabilidades")]
+        if intent == "chances":
+            if not equipo:
+                return [("warning", "¿De qué equipo? Ej.: «¿cómo viene River?».")]
+            pct, dfp = chances_mc(equipo, eqs, jug, pen)
+            return [_placa_png(placa_chances_mc_png(equipo, pct), f"chances_{equipo}.png"),
+                    ("md", f"**¿Cómo viene {equipo}?** Clasifica en **{round(pct)} de cada 100 torneos simulados** "
+                           f"(fuerza estimada por su rendimiento). _Como hay muchas fechas por delante, esto es simulación, no cuenta exacta._"),
+                    ("df", dfp, "Probabilidades (simulación)")]
+        if intent == "proyeccion":
+            ov = _stats(eqs, jug); restx = _restantes(eqs, pen)
+            basex = {e: {"pts": ov[e]["pts"], "pj": ov[e]["pj"], "dg": ov[e]["dg"]} for e in eqs}
+            return [("df", liga_proyeccion_df(basex, restx), "Proyección si cada uno mantiene su ritmo"),
+                    ("md", "_Proyección = puntos actuales + puntos por partido × partidos restantes._")]
+        if intent in ("necesita", "numero_magico", "depende", "conviene", "visual", "puesto_exacto"):
+            if not equipo:
+                return [("warning", "Decime el equipo. Ej.: «número mágico de River» o «qué necesita River».")]
+            nn = 1 if objetivo == "campeon" else (n or DIRECTO())
+            return [("md", numero_magico_texto(equipo, eqs, jug, pen, nn)),
+                    ("df", maximos_minimos(eqs, jug, pen), "Puntos máximos posibles")]
+        return [("info", "Es una **liga** con muchas fechas, así que trabajo por puntos. Probá: "
+                         "**tabla**, **si terminara hoy**, **número mágico de X**, **máximos**, "
+                         "**asegurados** o **probabilidades**.")]
+
+    if intent == "ayuda":
+        return [("md", AYUDA_MD)]
+    if intent == "tabla":
+        return [("df", tabla(eqs, jug), "Tabla actual"),
+                ("info", resumen_grupo_texto(eqs, jug, esc, pen))]
+    if intent == "panorama":
+        return [("info", resumen_grupo_texto(eqs, jug, esc, pen)),
+                ("df", panorama(eqs, jug, esc), "Panorama de clasificación")]
+    if intent == "probabilidades":
+        return [("md", "Probabilidades estimadas por simulación (Poisson, ~8.000 sorteos) con **fuerza estimada** por el rendimiento de cada equipo. Es una estimación, no la cuenta exacta."),
+                ("df", probabilidades(eqs, jug, pen, fuerza=fuerza_desde_stats(eqs, jug)), "Probabilidades")]
+    if intent == "proyeccion":
+        ov = _stats(eqs, jug); restx = _restantes(eqs, pen)
+        basex = {e: {"pts": ov[e]["pts"], "pj": ov[e]["pj"], "dg": ov[e]["dg"]} for e in eqs}
+        return [("df", liga_proyeccion_df(basex, restx), "Proyección si cada uno mantiene su ritmo"),
+                ("md", "_Proyección = puntos actuales + puntos por partido × partidos restantes._")]
+    if intent == "maximos":
+        return [("df", maximos_minimos(eqs, jug, pen), "Puntos máximos posibles")]
+    if intent == "hoy":
+        return [("md", si_terminara_hoy_texto(eqs, jug, pen)),
+                ("df", tabla(eqs, jug), "Tabla actual")]
+    if intent == "depende":
+        if equipo:
+            cat, msg = en_sus_manos(equipo, esc, pen)
+            icon = {"manos": "🟢", "ayuda": "🟡", "ya": "✅", "out": "🔴"}.get(cat, "•")
+            return [("md", f"### ¿De qué depende {equipo}?"), ("md", f"{icon} **{equipo}** — {msg}"),
+                    ("df", tabla(eqs, jug), "Tabla actual")]
+        return [("md", en_sus_manos_texto(eqs, jug, esc, pen)),
+                ("df", tabla(eqs, jug), "Tabla actual")]
+    if intent == "relato":
+        if equipo:
+            return [("md", f"### {equipo} · el escenario"),
+                    ("md", relato_equipo_texto(equipo, eqs, jug, esc, pen))]
+        return [("md", "### El grupo · el escenario"),
+                ("md", relato_grupo_texto(eqs, jug, esc, pen))]
+    if intent == "visual":
+        if not equipo:
+            return [("warning", "¿De qué equipo querés la grilla? Probá «grilla de River».")]
+        spec = spec_necesita(equipo, esc, pen)
+        if not spec:
+            return [("info", f"A {equipo} le queda más de un partido, así que la grilla sería enorme. Va el detalle en texto:"),
+                    ("md", que_necesita_completo_texto(equipo, esc, pen))]
+        return [_placa(spec, f"necesita_{equipo}.png")]
+    if intent == "mapa":
+        return [_placa(spec_mapa(eqs, esc), "mapa_grupo.png")]
+    if intent == "bisagra":
+        out = [("md", "### Partidos que más definen"), ("md", partido_bisagra_texto(eqs, jug, pen, esc))]
+        png = placa_bisagra_png(eqs, jug, pen, esc)
+        if png:
+            out.append(_placa_png(png, "partidos_bisagra.png"))
+        return out
+    if intent == "barras":
+        if not equipo:
+            return [("warning", "¿De qué equipo? Ej.: «barras de River».")]
+        return [_placa_png(barras_puesto_png(equipo, esc), f"barras_{equipo}.png")]
+    if intent == "chances":
+        if not equipo:
+            return [("warning", "¿De qué equipo querés ver las chances? Ej.: «¿cómo viene River?».")]
+        return [_placa_png(placa_chances_png(equipo, eqs, jug, esc, pen), f"chances_{equipo}.png"),
+                ("md", chances_texto(equipo, eqs, jug, esc, pen))]
+    if intent == "arbol":
+        if not equipo:
+            return [("warning", "¿De qué equipo querés el árbol? Ej.: «árbol de River».")]
+        png = placa_arbol_png(equipo, eqs, jug, esc, pen)
+        if not png:
+            return [("info", f"{equipo} tiene demasiados partidos pendientes para un árbol claro; probá «qué necesita {equipo}».")]
+        return [_placa_png(png, f"arbol_{equipo}.png"),
+                ("md", f"Árbol de decisión de **{equipo}** según su resultado. Para el detalle escrito, pedí «qué necesita {equipo}».")]
+    if intent == "previa":
+        lab = ""
+        for L2, (e2, _, _) in _tour_grupos().items():
+            if set(e2) == set(eqs):
+                lab = L2; break
+        out = [("md", previa_fecha_texto(eqs, jug, esc, pen))]
+        png = placa_previa_fecha_png(eqs, jug, esc, pen, lab)
+        if png:
+            out.append(_placa_png(png, "previa_fecha.png"))
+        return out
+    if intent == "juega":
+        lab = ""
+        for L2, (e2, _, _) in _tour_grupos().items():
+            if set(e2) == set(eqs):
+                lab = L2; break
+        return [_placa_png(placa_que_se_juega_png(eqs, jug, esc, pen, lab), "que_se_juega.png"),
+                ("md", que_se_juega_texto(eqs, jug, esc, pen))]
+    if intent == "simulador":
+        return [("info", "Abrí el panel **🎮 Simulador: ¿qué pasa si…?** (arriba de las sugerencias). "
+                         "Elegí el resultado de cada partido que falta y te muestro la tabla resultante, quién clasifica y la previa en prosa.")]
+    if intent == "comparar":
+        e2 = acc.get("equipo2")
+        if not (equipo and e2):
+            return [("warning", "Decime los dos equipos. Ej.: «comparar River y Boca».")]
+        if e2 not in eqs:
+            e2 = detectar_equipo(e2, eqs)
+        if not e2 or e2 == equipo:
+            return [("warning", "Necesito dos equipos distintos del mismo grupo para comparar.")]
+        return [_placa(spec_comparar(equipo, e2, eqs, jug, esc, pen), f"comparar_{equipo}_{e2}.png")]
+    if intent == "puesto":
+        if not equipo:
+            return [("warning", "¿De qué equipo? Ej.: «River puede salir 1º».")]
+        puesto = n or 1
+        spec = spec_puesto(equipo, esc, pen, puesto)
+        if not spec:
+            return [("info", f"A {equipo} le queda más de un partido; la grilla sería enorme. Va el detalle en texto:"),
+                    ("md", resultados_para_puesto_texto(equipo, esc, pen, ("exacto", puesto)))]
+        return [_placa(spec, f"{equipo}_puesto_{puesto}.png")]
+    if intent == "asegurados":
+        nn = n or DIRECTO()
+        return [("df", clasificado_eliminado(eqs, jug, pen, nn), f"Asegurados / sin chances (top {nn})")]
+    if intent == "numero_magico":
+        if not equipo:
+            return [("warning", "¿De qué equipo? Probá: «número mágico de River».")]
+        nn = 1 if objetivo == "campeon" else (n or DIRECTO())
+        return [("md", numero_magico_texto(equipo, eqs, jug, pen, nn))]
+
+    if not equipo:
+        return [("md", "No identifiqué a qué equipo te referís. " + AYUDA_MD)]
+
+    team_pend = sum(1 for p in pen if equipo in p)
+    muchos = team_pend >= 2
+
+    if intent == "conviene":
+        out = [("md", f"### Qué le conviene a {equipo}"), ("md", mejor_resultado_texto(equipo, esc, pen))]
+        co = conviene_otros_texto(equipo, esc, pen)
+        if co:
+            out.append(("md", co))
+        ideal = combo_ideal_texto(equipo, esc, pen)
+        if ideal:
+            out.append(("md", ideal))
+        out.append(("df", tabla(eqs, jug), "Tabla actual"))
+        return out
+
+    if intent == "puesto_exacto" and n:
+        return [("md", f"### {equipo}: terminar exactamente {n}º"),
+                ("md", resultados_para_puesto_texto(equipo, esc, pen, ("exacto", n))),
+                ("df", tabla(eqs, jug), "Tabla actual")]
+
+    # intent == "necesita"
+    if objetivo == "campeon":
+        obj, nn = "campeon", 1
+    elif objetivo == "champions":
+        obj, nn = "top", 4
+    elif objetivo == "descenso":
+        obj, nn = "descenso", (n or 1)
+    elif objetivo == "tercero":
+        obj, nn = "tercero", 3
+    else:
+        obj, nn = "top", (n or DIRECTO())
+    es_default = (obj == "top" and nn == DIRECTO())
+
+    blocks = [("md", f"### ¿Qué necesita {equipo}?")]
+    if obj == "tercero":
+        if MEJORES_TERCEROS() > 0:
+            blocks.append(("md", apartado_terceros_texto(equipo, esc, pen)))
+        else:
+            blocks.append(("info", "En este torneo los terceros no clasifican (Mejores 3ºs = 0 en el panel)."))
+    elif muchos:
+        blocks.append(("info", f"A {equipo} le quedan {team_pend} partidos: con tantos por jugar el detalle "
+                               f"gol por gol es enorme, así que va el resumen por puntos."))
+        blocks.append(("md", necesita_por_resultados_texto(equipo, eqs, jug, pen, nn)))
+    else:
+        s = situacion(equipo, esc)
+        if es_default and s["ya_directo"]:
+            blocks.append(("success", f"🟢 {equipo} ya clasificó directo (siempre entre los {DIRECTO()} primeros)."))
+        elif es_default and s["eliminado"]:
+            blocks.append(("error", f"🔴 {equipo} no llega a zona de clasificación en ningún escenario."))
+        else:
+            usar_unificado = es_default and MEJORES_TERCEROS() > 0 and s["puede_tercero"] and not s["ya_directo"]
+            if usar_unificado:
+                blocks.append(("md", que_necesita_completo_texto(equipo, esc, pen)))
+                n3, T = s["ntercero"], s["total"]
+                blocks.append(("info",
+                    f"«3º · depende de otros grupos»: quedar tercero clasifica solo si {equipo} entra "
+                    f"entre los {MEJORES_TERCEROS()} mejores terceros del torneo (se compara con los terceros "
+                    f"de los otros grupos). {equipo} termina 3º en {n3}/{T} escenarios."))
+                # El árbol ya muestra cuándo puede salir 1º (rango «1º-2º»), así que no repetimos el bloque de campeón.
+            else:
+                blocks.append(("md", que_necesita_texto(equipo, esc, pen, obj, n=nn)))
+                if es_default and s["puede_1"] and not s["ya_1"]:
+                    blocks += [("md", "---"), ("md", que_necesita_texto(equipo, esc, pen, "campeon"))]
+    blocks.append(("df", tabla(eqs, jug), "Tabla actual (para ubicarse)"))
+    return blocks
+
+
+# ─── BLOQUES DE NAVEGACIÓN ────────────────────────────────────────────────────────
+def _bloques_listar_grupos():
+    gs = _tour_grupos()
+    if len(gs) <= 1:
+        return [("info", "Tenés cargado un solo grupo. Para tener todos, pegá o importá el torneo "
+                         "completo desde el panel lateral (API o pegar texto).")]
+    lineas = ["**Grupos cargados:**"]
+    for lab, (eqs, _, _) in gs.items():
+        lineas.append(f"- **Grupo {lab}**: " + ", ".join(eqs))
+    return [("md", "\n".join(lineas))]
+
+
+def _bloques_ver_grupo(lab):
+    gs = _tour_grupos()
+    lab = _norm_txt(lab or "").replace("grupo", "").strip().upper()
+    if lab not in gs:
+        disp = ", ".join(gs) if gs else "—"
+        return [("warning", f"No encuentro el Grupo {lab}. Disponibles: {disp}. "
+                            "(Si falta, cargá el torneo completo en el panel lateral.)")]
+    eqs, jug, pen = gs[lab]
+    cargar_estado(eqs, jug, pen)
+    return [("success", f"Cargué el **Grupo {lab}**: {', '.join(eqs)}."),
+            ("df", tabla(eqs, jug), f"Grupo {lab} — tabla actual"),
+            ("info", resumen_grupo_texto(eqs, jug, st.session_state.ESTADO["esc"], pen))]
+
+
+def _bloques_buscar_equipo(team_q):
+    lab, team, datos = _buscar_grupo_de(team_q)
+    if not lab:
+        gs = _tour_grupos()
+        if len(gs) <= 1:
+            return [("warning", f"Solo tengo un grupo cargado, así que no puedo buscar en otros. "
+                                "Cargá el torneo completo (API o pegar) desde el panel lateral.")]
+        return [("warning", f"No encontré ese equipo en los grupos cargados. ¿Está bien escrito?")]
+    eqs, jug, pen = datos
+    cargar_estado(eqs, jug, pen)
+    comp = [e for e in eqs if e != team]
+    return [("success", f"**{team}** está en el **Grupo {lab}**, junto a {', '.join(comp)}."),
+            ("info", f"Cambié a ese grupo: ya podés preguntar, por ejemplo «¿qué necesita {team}?»."),
+            ("df", tabla(eqs, jug), f"Grupo {lab} — tabla actual")]
+
+
+# ─── ROUTER POR PALABRAS CLAVE (fallback, sin LLM) ────────────────────────────────
+def _parse_kw(q):
+    qn = _norm_txt(q)
+    eqs = st.session_state.ESTADO["equipos"]
+    team = detectar_equipo(q, eqs)
+    has = lambda *ws: any(w in qn for w in ws)
+    nw = len(qn.split())
+    if (has("por que", "porque", "porqué") and nw <= 3) or has("explicame", "explicalo", "explica eso", "fundamento", "de donde sale", "de donde sacas", "como llegaste", "como sacas eso"):
+        return {"intent": "porque"}
+    m = _re.search(r"top\s*(\d+)|primeros?\s*(\d+)|(\d+)\s*primeros|puesto\s*(\d+)|(\d+)\s*[oº]", qn)
+    n_det = int(next(g for g in m.groups() if g)) if m else None
+    mg = _re.search(r"grupo\s+([a-l])\b", qn)
+
+    if has("ayuda", "help", "que puedo", "como funciona"):
+        return {"intent": "ayuda"}
+    if has("relato", "contame", "para la nota", "escribime", "escribi ", "narra", "narrá", "parrafo", "párrafo", "escenario escrito", "resumen escrito", "resumime", "redacta"):
+        return {"intent": "relato", "equipo": team}
+    if has("arbol", "árbol", "flowchart", "diagrama de decision", "arbol de decision", "si entonces", "diagrama si"):
+        return {"intent": "arbol", "equipo": team}
+    if has("previa", "previa de la fecha", "que se define en cada", "que define cada partido", "preview", "que define cada uno de los partidos", "como puede terminar la fecha", "como termina la fecha", "como le va en la fecha", "como puede quedar la fecha", "como puede terminar la jornada"):
+        return {"intent": "previa", "equipo": team}
+    if has("que se juega", "qué se juega", "se juega cada", "en una frase", "que necesita cada", "resumen en frases", "que esta en juego"):
+        return {"intent": "juega"}
+    if has("simulador", "que pasa si", "simular", "y si gana", "y si pierde", "y si empata", "que pasaria si"):
+        return {"intent": "simulador"}
+    if has("cruces directos", "cruce directo", "duelos directos", "duelo directo", "rivales directos", "mano a mano", "partidos entre", "seis puntos", "finales entre"):
+        return {"intent": "duelos"}
+    if has("zonas", "por zona", "tabla por zona", "tabla con zona", "mostrar zonas", "ver zonas"):
+        return {"intent": "zonas"}
+        _allt = [e for (e2, _, _) in _tour_grupos().values() for e in e2] or eqs
+        tcam = detectar_equipo(q, _allt) or ("Argentina" if "Argentina" in _allt else None)
+    if has("visual", "grilla", "matriz", "cuadro de escenarios", "mapa de escenarios", "tabla de escenarios", "grafic", "placa"):
+        return {"intent": "visual", "equipo": team}
+    if has("quien clasifica", "quienes clasifican", "quien entra", "quienes entran", "clasificados hoy", "como esta la zona"):
+        return {"intent": "tabla"}
+    if has("quien se salva", "quien esta en riesgo", "quienes estan en riesgo", "quien peligra", "zona de descenso", "quien se va"):
+        return {"intent": "descenso", "equipo": team}
+    if has("quien juega la libertadores", "quienes van a la libertadores", "quien va a la sudamericana", "cupos de copa"):
+        return {"intent": "copas", "equipo": team}
+    if has("cuantos puntos necesita", "cuanto le falta", "cuantos puntos le faltan", "que le falta", "puede clasificar", "esta eliminado", "sigue con chances"):
+        return {"intent": "playoffs", "equipo": team}
+    if has("contra quien juega", "quienes le quedan", "que rivales", "quien le queda"):
+        return {"intent": "ficha", "equipo": team}
+    if has("relato", "contame", "como viene la zona", "resumen de la zona", "panorama de la zona", "como esta la pelea"):
+        return {"intent": "relato", "equipo": team}
+    if has("estado de la fecha", "como se juega esta fecha", "ultimos resultados", "resultados en vivo",
+           "que esta cargado", "quien ya jugo", "que falta jugar", "partidos de hoy", "en vivo"):
+        return {"intent": "estado_fecha"}
+    if has("actualizado", "al dia", "esta al dia", "datos viejos", "que fecha tengo", "que fecha va"):
+        return {"intent": "actualizado"}
+    if has("playoff", "play off", "play-off", "octavos", "reducido", "entrar a los ocho", "top 8", "clasificar a octavos"):
+        return {"intent": "octavos" if has("octavos", "cruce", "llave", "quien juega con") else "playoffs", "equipo": team}
+    if has("conviene", "le sirve", "hinchar", "para quien", "le rinde", "otra cancha", "otros resultados", "que hinchar", "me conviene", "por quien"):
+        return {"intent": "conviene", "equipo": team}
+    if has("chance", "probabilidad", "porcentaje", "posibilidad", "posibilidades"):
+        return {"intent": "probabilidades", "equipo": team}
+    if has("copas", "libertadores", "sudamericana", "internacional", "plazas", "cupos"):
+        return {"intent": "copas", "equipo": team}
+    if has("anual", "tabla general", "campeon de liga", "acumulada"):
+        return {"intent": "anual", "equipo": team}
+    if has("descenso", "descender", "se va al ascenso", "permanencia", "zona roja"):
+        return {"intent": "descenso", "equipo": team}
+    if has("promedios", "promedio de", "el promedio", "descenso por promedio", "desciende por promedio"):
+        return {"intent": "promedios", "equipo": team}
+    if has("ficha de", "ficha del", "stats de", "estadisticas de", "estadisticas del", "numeros de", "los numeros de"):
+        return {"intent": "ficha", "equipo": team}
+    toks = set(qn.split())
+    if ("forma" in toks and "informe" not in qn) or has("ultimos 5", "ultimos cinco", "racha", "rachas", "tabla de forma"):
+        return {"intent": "forma", "equipo": team}
+    if has("calendario", "dificultad", "fixture dificil", "fixture mas dificil", "fixture restante", "rivales que quedan", "que rivales le quedan", "fixture que queda"):
+        return {"intent": "calendario", "equipo": team}
+    if has("de local", "de visitante", "localia", "local y visitante", "como local", "como visitante", "rendimiento local"):
+        return {"intent": "localia", "equipo": team}
+    if has("proyeccion", "proyección", "proyectado", "ritmo", "a este paso", "promedio de puntos", "puntos por partido"):
+        return {"intent": "proyeccion"}
+    if has("como viene", "como esta", "como llega", "chances", "que chance", "esta complicado", "esta bien parado", "esta para clasificar", "esta adentro", "esta afuera", "termometro"):
+        return {"intent": "chances", "equipo": team}
+    if has("bisagra", "partido clave", "partido decisivo", "partido mas importante", "que partido define", "que se define", "mas define", "partido mas decisivo"):
+        return {"intent": "bisagra", "equipo": team}
+    if has("barras", "en barras", "distribucion", "grafico de barras", "chances por puesto", "reparto por puesto"):
+        return {"intent": "barras", "equipo": team}
+    if has("mapa", "calor", "heatmap", "reparto de puesto", "como se reparten", "donde termina cada"):
+        return {"intent": "mapa"}
+    if has("comparar", "compara", "versus", " vs ", "vs.", "mano a mano", "frente a", "enfrenta", "contra "):
+        dos = detectar_equipos(q, eqs, 2)
+        if len(dos) == 2:
+            return {"intent": "comparar", "equipo": dos[0], "equipo2": dos[1]}
+    _posq = _pos_pedida(qn)
+    if _posq and has("puede salir", "puede ser", "puede terminar", "puede quedar", "sale ", "termina", "terminar", "queda ", "salir") and not has("necesita", "conviene"):
+        return {"intent": "puesto", "equipo": team, "n": _posq}
+    # navegación de grupos
+    if has("en que grupo", "en cual grupo", "donde juega", "donde esta", "de que grupo", "grupo de", "que grupo es"):
+        return {"intent": "buscar_equipo", "equipo": q}
+    if has("que grupos", "cuales grupos", "lista de grupos", "todos los grupos", "ver grupos") or qn.strip() == "grupos":
+        return {"intent": "listar_grupos"}
+    if mg and has("grupo"):
+        return {"intent": "ver_grupo", "grupo": mg.group(1)}
+
+    if has("termina hoy", "terminara hoy", "si terminara", "quedaria hoy", "como quedaria", "quien pasa hoy", "clasifica hoy", "tabla de hoy", "fase hoy"):
+        return {"intent": "hoy"}
+    if has("de quien depende", "depende de si", "en sus manos", "depende de el mismo", "depende de ella", "lo tiene en sus manos", "quien depende"):
+        return {"intent": "depende", "equipo": team}
+    if has("tabla", "posicion") and not has("conviene", "necesita"):
+        return {"intent": "tabla"}
+    if has("panorama", "pantallazo", "como esta el grupo", "como viene") or (has("resumen") and not team):
+        return {"intent": "panorama"}
+    if has("probabilidad", "chance", "porcentaje"):
+        return {"intent": "probabilidades"}
+    if has("maximo", "puntos posibles", "techo"):
+        return {"intent": "maximos"}
+    if has("asegurad", "eliminad", "quien esta adentro", "clasificado"):
+        return {"intent": "asegurados", "n": n_det}
+    if has("numero magico", "magico", "asegurar"):
+        return {"intent": "numero_magico", "equipo": team, "objetivo": "campeon" if has("campeon", "primero") else None, "n": n_det}
+    if has("conviene", "le sirve", "hinchar", "para quien", "le rinde", "otra cancha", "otros resultados", "otros partidos", "que hinchar", "por quien", "me conviene"):
+        return {"intent": "conviene", "equipo": team}
+    if has("exacto", "exactamente") and n_det:
+        return {"intent": "puesto_exacto", "equipo": team, "n": n_det}
+    if has("campeon", "salir primero", "ganar el grupo", "ganar la zona"):
+        return {"intent": "necesita", "equipo": team, "objetivo": "campeon"}
+    if has("champions"):
+        return {"intent": "necesita", "equipo": team, "objetivo": "champions"}
+    if has("descenso", "descender", "salvar", "no bajar"):
+        return {"intent": "necesita", "equipo": team, "objetivo": "descenso", "n": n_det or 1}
+    if has("tercero", "mejor tercero"):
+        return {"intent": "necesita", "equipo": team, "objetivo": "tercero"}
+    return {"intent": "necesita", "equipo": team, "objetivo": "clasificar", "n": n_det}
+
+
+# ─── ROUTER CON LLM (solo interpreta; las cuentas siguen en Python) ────────────────
+def _llm_parse(q):
+    gs = _tour_grupos()
+    if gs:
+        contexto = "Grupos y equipos del torneo:\n" + "\n".join(f"- Grupo {lab}: {', '.join(d[0])}" for lab, d in gs.items())
+    else:
+        contexto = "Equipos del grupo cargado: " + ", ".join(st.session_state.ESTADO["equipos"])
+    sistema = (
+        "Sos un router de intención para una calculadora de escenarios de fútbol.\n" + contexto + "\n\n"
+        "Respondé EXCLUSIVAMENTE un objeto JSON (sin texto extra, sin ```), con estas claves:\n"
+        '- "intent": uno de [necesita, conviene, tabla, panorama, probabilidades, numero_magico, '
+        'asegurados, maximos, puesto_exacto, buscar_equipo, ver_grupo, listar_grupos, depende, hoy, relato, '
+        'visual, comparar, puesto, mapa, bisagra, barras, zonas, chances, relato, duelos, porque, simulador, arbol, juega, previa, proyeccion, ficha, forma, calendario, localia, promedios, playoffs, octavos, copas, anual, descenso, ayuda]\n'
+        '- "equipo": nombre EXACTO de un equipo (de cualquier grupo) o null\n'
+        '- "equipo2": segundo equipo (solo para comparar) o null\n'
+        '- "grupo": letra del grupo (para ver_grupo) o null\n'
+        '- "objetivo": solo si intent=necesita: [clasificar, campeon, champions, descenso, tercero]; default clasificar\n'
+        '- "n": entero o null (top N, descenso N, o el puesto para intent=puesto/puesto_exacto)\n'
+        '- "intro": una frase breve en español rioplatense que presente la respuesta, SIN dar números ni resultados.\n'
+        "Pistas: 'en qué grupo está X'/'dónde juega X' => buscar_equipo (equipo=X). "
+        "'equipos del grupo C'/'grupo C' => ver_grupo (grupo='C'). 'qué grupos hay' => listar_grupos. "
+        "'de quién depende X'/'lo tiene en sus manos' => depende. 'si terminara hoy'/'quién pasa hoy' => hoy. "
+        "'contame/escribime/relato/para la nota' => relato (equipo si lo nombran, si no el grupo). "
+        "'grilla/visual/matriz' => visual (equipo). 'comparar X y Z'/'X vs Z' => comparar (equipo=X, equipo2=Z). "
+        "'X puede salir/terminar Nº' => puesto (equipo=X, n=N). 'mapa/mapa de calor/dónde termina cada uno' => mapa. "
+        "'promedios'/'promedio de X'/'desciende por promedio' => promedios (equipo=X si lo nombra). 'ficha de X'/'stats de X' => ficha. 'forma'/'racha'/'últimos 5' => forma. 'calendario'/'dificultad del fixture'/'rivales que quedan' => calendario. 'de local'/'de visitante' => localia. 'proyección'/'ritmo'/'a este paso cuánto suma' => proyeccion. 'por qué'/'explicame'/'de dónde sale eso' (a secas, sin equipo) => porque (explica la última respuesta). 'cómo viene X'/'qué chances tiene X'/'está para clasificar X'/'termómetro de X' => chances (equipo=X). 'contame el escenario de X'/'relato de X' => relato (equipo=X); 'relato del grupo' => relato sin equipo. 'playoffs'/'octavos'/'cruces' => octavos. 'copas'/'libertadores'/'sudamericana' => copas. 'anual'/'tabla general' => anual. 'descenso'/'promedios' => descenso. "
+        "'campeón'/'ganar el grupo' => objetivo campeon. 'no descender' => descenso."
+    )
+    body = {"model": st.session_state.LLM_MODEL, "max_tokens": 400,
+            "system": sistema, "messages": [{"role": "user", "content": q}]}
+    r = requests.post("https://api.anthropic.com/v1/messages",
+                      headers={"x-api-key": st.session_state.LLM_KEY,
+                               "anthropic-version": "2023-06-01",
+                               "content-type": "application/json"},
+                      json=body, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    txt = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+    obj = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
+    return obj, obj.get("intro")
+
+
+def responder(q):
+    usar_llm = st.session_state.LLM_ON and str(st.session_state.LLM_KEY).strip()
+    intro = None
+    err_note = None
+    if usar_llm:
+        try:
+            acc, intro = _llm_parse(q)
+            st.session_state["LLM_ERROR"] = ""
+        except Exception as e:
+            acc = _parse_kw(q)
+            st.session_state["LLM_ERROR"] = str(e)[:200]
+            err_note = ("info", f"⚠️ El asistente Claude no respondió ({str(e)[:90]}…). Te respondo igual por palabras clave. "
+                                "Revisá la API key y el modelo en el panel; o desactivalo (todo funciona por palabras clave: escribí «ayuda»).")
+    else:
+        acc = _parse_kw(q)
+
+    pre = [("md", f"_{intro}_")] if intro else []
+    if err_note:
+        pre = [err_note] + pre
+    acc["q"] = q
+    intent = acc.get("intent")
+
+    if intent == "listar_grupos":
+        return pre + _bloques_listar_grupos()
+    if intent == "ver_grupo":
+        return pre + _bloques_ver_grupo(acc.get("grupo"))
+    if intent == "buscar_equipo":
+        return pre + _bloques_buscar_equipo(acc.get("equipo") or q)
+
+    # Cambio automático de grupo si el equipo no está en el grupo cargado
+    cur = st.session_state.ESTADO["equipos"]
+    team_intents = {"necesita", "conviene", "numero_magico", "puesto_exacto", "visual", "puesto", "barras", "chances", "arbol", "ficha"}
+    ya = acc.get("equipo") and detectar_equipo(acc["equipo"], cur)
+    if intent in team_intents and not ya:
+        lab, team, datos = _buscar_grupo_de(acc.get("equipo") or q)
+        if lab:
+            cargar_estado(*datos)
+            acc["equipo"] = team
+            pre = pre + [("info", f"Cambié al Grupo {lab}, donde juega {team}.")]
+        elif st.session_state.get("ultimo_equipo") and not acc.get("equipo"):
+            acc["equipo"] = st.session_state["ultimo_equipo"]  # seguir hablando del último equipo
+
+    # Memoria de contexto: recordar el último equipo mencionado
+    if acc.get("equipo"):
+        st.session_state["ultimo_equipo"] = acc["equipo"]
+
+    if intent != "porque":
+        st.session_state["ULTIMO"] = {"intent": intent, "equipo": acc.get("equipo"),
+                                      "n": acc.get("n"), "objetivo": acc.get("objetivo"), "q": q}
+    return pre + ejecutar_accion(acc)
+
+
+def render_blocks(blocks, prefix="x"):
+    for i, b in enumerate(blocks):
+        kind = b[0]
+        if kind == "md":
+            st.markdown(b[1])
+        elif kind == "placa":
+            if b[1]:
+                st.markdown(b[1], unsafe_allow_html=True)
+            else:
+                st.image(b[2], use_container_width=True)
+            st.download_button("Descargar imagen", b[2], file_name=b[3], mime="image/png", key=f"{prefix}_dl{i}")
+        elif kind == "df":
+            st.dataframe(b[1], use_container_width=True, hide_index=True)
+            if len(b) > 2 and b[2]:
+                st.caption(b[2])
+        elif kind == "html":
+            st.markdown(b[1], unsafe_allow_html=True)
+        elif kind == "info":
+            st.info(b[1])
+        elif kind == "success":
+            st.success(b[1])
+        elif kind == "warning":
+            st.warning(b[1])
+        elif kind == "error":
+            st.error(b[1])
+
+
+# ─── MESA DE REDACCIÓN ───────────────────────────────────────────────────────
+def _rd_position(base, team):
+    df = liga_tabla_df(base)
+    hit = df.index[df["Equipo"] == team].tolist()
+    return int(hit[0] + 1) if hit else None
+
+
+def _rd_competition_table(base, rest, cutoff, probability=None):
+    probability = probability or {}
+    rows = []
+    for _, row in liga_tabla_df(base).iterrows():
+        team = row["Equipo"]
+        pos = int(row["Pos"])
+        ceiling = int(row["PTS"]) + 3 * int(rest.get(team, 0))
+        if pos <= cutoff:
+            status = "Adentro hoy"
+        elif ceiling < int(liga_tabla_df(base).iloc[min(cutoff - 1, len(base) - 1)]["PTS"]):
+            status = "Muy comprometido"
+        else:
+            status = "En pelea"
+        out = {"Pos": pos, "Equipo": team, "PTS": int(row["PTS"]),
+               "Techo": ceiling, "Estado": status}
+        if team in probability:
+            out["Chance estimada"] = f"{probability[team]:.0f}%"
+        rows.append(out)
+    return pd.DataFrame(rows)
+
+
+def lpf_estado_hitos(Z, rest, pend, apertura=None, camps=("", "", ""), extras=("", ""), prom=None):
+    """Foto EXACTA del estado de cada equipo frente a cada objetivo.
+    Devuelve {equipo: {objetivo: 'in'|'out'|'pelea'}} usando solo cuentas exactas
+    (techos y mínimos), nunca simulación. Base del detector de hitos."""
+    out = {}
+    anual = lpf_anual_base(Z, apertura or {})
+    try:
+        P = lpf_plazas_copas(Z, apertura, camps, extras)
+        red = P.get("reducida") or []
+        n_lib = int(P.get("n_tabla_lib") or 0)
+    except Exception:
+        red, n_lib = [], 0
+    base_red = {e: anual[e] for e in red if e in anual}
+    for lab, base in (Z or {}).items():
+        for e in base:
+            st_e = {}
+            st_e["playoffs"] = _liga_in_out(e, base, rest, _LPF_TOP_OCTAVOS)
+            if e in base_red and n_lib:
+                st_e["libertadores"] = _liga_in_out(e, base_red, rest, n_lib)
+                st_e["sudamericana"] = _liga_in_out(e, base_red, rest, n_lib + 6)
+            if anual and e in anual:
+                # permanencia por la Anual: 'in' = salvado (no puede ser último)
+                st_e["permanencia_anual"] = _liga_in_out(e, anual, rest, max(1, len(anual) - 1))
+            out[e] = st_e
+    return out
+
+_HITO_NOMBRE = {"playoffs": "los playoffs (octavos)", "libertadores": "la Copa Libertadores",
+                "sudamericana": "la Copa Sudamericana", "permanencia_anual": "la permanencia (Tabla Anual)"}
+
+def lpf_detectar_hitos(antes, ahora):
+    """Compara dos fotos de lpf_estado_hitos y devuelve los HECHOS nuevos, listos
+    para publicar. Solo cambios de estado matemáticos (exactos)."""
+    hitos = []
+    for e, objs in (ahora or {}).items():
+        prev = (antes or {}).get(e, {})
+        for obj, val in objs.items():
+            old = prev.get(obj)
+            if old is None or old == val or val == "pelea":
+                continue
+            nombre = _HITO_NOMBRE.get(obj, obj)
+            if val == "in":
+                if obj == "permanencia_anual":
+                    txt = f"**{e} se salvó del descenso por la Tabla Anual.** Ya no puede terminar último: la permanencia por esa vía está asegurada."
+                    tipo = "bueno"
+                else:
+                    txt = f"**{e} aseguró {nombre}.** Ya no depende de nadie: matemáticamente no puede quedar afuera."
+                    tipo = "bueno"
+            else:
+                if obj == "permanencia_anual":
+                    txt = f"**{e} quedó condenado por la Tabla Anual**: ya no puede escapar del último puesto de esa tabla."
+                    tipo = "malo"
+                else:
+                    txt = f"**{e} quedó eliminado de {nombre}.** Ni ganando todo lo que le queda llega."
+                    tipo = "malo"
+            hitos.append({"equipo": e, "objetivo": obj, "de": old, "a": val, "tipo": tipo, "texto": txt})
+    orden = {"libertadores": 0, "playoffs": 1, "permanencia_anual": 2, "sudamericana": 3}
+    hitos.sort(key=lambda h: (orden.get(h["objetivo"], 9), h["equipo"]))
+    return hitos
+
+def lpf_hitos_posibles(Z, rest, pend, apertura=None, camps=("", "", ""), extras=("", ""), fecha=None):
+    """Anticipa qué hitos PODRÍAN darse en la jornada: para cada equipo en pelea,
+    si existe algún resultado de la fecha que lo deje adentro (o afuera) de un objetivo.
+    Exacto: prueba el mejor y el peor caso de la jornada."""
+    jornada, juegos, atrasados = lpf_jornada_actual(pend or [], forzar=fecha)
+    if jornada is None:
+        return []
+    todos = list(juegos) + [lv for lv, _f in atrasados]
+    estado = lpf_estado_hitos(Z, rest, pend, apertura, camps, extras)
+    avisos = []
+    for lab, base in (Z or {}).items():
+        for e in base:
+            if estado.get(e, {}).get("playoffs") != "pelea":
+                continue
+            mio = next((lv for lv in todos if e in lv), None)
+            if not mio:
+                continue
+            # mejor caso: gana el equipo y pierden los rivales de arriba de su zona
+            b2 = {x: dict(base[x]) for x in base}
+            r2 = dict(rest)
+            b2[e]["pts"] = b2[e]["pts"] + 3
+            r2[e] = max(0, r2.get(e, 0) - 1)
+            for (l, v) in todos:
+                for x in (l, v):
+                    if x in b2 and x != e:
+                        r2[x] = max(0, r2.get(x, 0) - 1)
+            if _liga_in_out(e, b2, r2, _LPF_TOP_OCTAVOS) == "in":
+                avisos.append(f"**{e}** puede **asegurar los playoffs esta fecha**: le alcanza con ganar y que se den los resultados de arriba.")
+    return avisos
+
+def lpf_chequeo_datos(E, annual=None, prom=None):
+    """Verifica que la carga haya quedado COMPLETA y coherente.
+    Devuelve (nivel, faltantes, detalle) con nivel 'ok' | 'parcial' | 'vacio'."""
+    faltan = []
+    det = []
+    Z = (E or {}).get("zonas_lpf") or {}
+    if not Z:
+        return "vacio", ["las tablas de las zonas"], []
+    nz = {lab: len(b) for lab, b in Z.items()}
+    tot = sum(nz.values())
+    det.append(f"Zonas: " + " · ".join(f"{lab} ({n})" for lab, n in sorted(nz.items())))
+    if tot != 30 or any(n != 15 for n in nz.values()):
+        faltan.append(f"equipos en las zonas (hay {tot}, deberían ser 30: 15 y 15)")
+    if not annual:
+        faltan.append("la Tabla Anual (copas y descenso)")
+    else:
+        det.append(f"Tabla Anual: {len(annual)} equipos")
+        if len(annual) != tot:
+            faltan.append(f"equipos en la Anual ({len(annual)} de {tot})")
+    if not prom:
+        faltan.append("los promedios (descenso por promedio)")
+    else:
+        det.append(f"Promedios: {len(prom)} equipos")
+    # ¿la Anual quedó vieja respecto de las zonas?
+    if annual:
+        try:
+            difs = {}
+            for b in Z.values():
+                for e, d in b.items():
+                    if e in annual:
+                        difs[e] = int(annual[e].get("pj", 0)) - int(d.get("pj", 0))
+            vals = sorted(set(difs.values()))
+            # La Anual = Apertura (terminado, igual para todos) + Clausura. Por lo tanto
+            # anual_pj - zona_pj DEBE ser el mismo número para los 30. Cualquier variación
+            # significa que la Anual no incorporó resultados que las zonas sí tienen.
+            if vals and (min(vals) < 0 or len(vals) > 1):
+                _atrasados = sorted([e for e, d in difs.items() if d != max(vals)])
+                faltan.append("**actualizar la Tabla Anual**: no incorporó los últimos resultados que sí están en las "
+                              f"zonas ({len(_atrasados)} equipo(s), p. ej. {', '.join(_atrasados[:3])}). "
+                              "Hasta corregirla, los puestos y las cuentas de **copas y descenso** salen mal. "
+                              "Pegá la tabla actualizada en «Otras formas de cargar»")
+            malos_pts = [e for e, d in ((x, y) for b in Z.values() for x, y in b.items())
+                         if e in annual and int(annual[e].get("pts", 0)) < int(d.get("pts", 0))]
+            if malos_pts:
+                faltan.append(f"revisar la **Tabla Anual**: {len(malos_pts)} equipo(s) tienen menos puntos en la Anual "
+                              f"que en su zona, lo cual es imposible ({', '.join(malos_pts[:3])})")
+        except Exception:
+            pass
+    # Cotas duras: la Anual no puede tener más partidos que Apertura(16) + Clausura(16),
+    # ni un equipo más puntos que 3 × PJ. Un valor imposible es siempre un error de datos.
+    if annual:
+        _imposibles = []
+        _pj_zona = {e: int(d.get("pj", 0)) for b in Z.values() for e, d in b.items()}
+        for e, d in annual.items():
+            _pj = int(d.get("pj", 0)); _pt = int(d.get("pts", 0))
+            # Invariante exacto: Anual = Apertura (16 fechas, ya terminado) + Clausura (su zona)
+            _esperado = LPF_APERTURA_PJ + _pj_zona.get(e, 0)
+            if e in _pj_zona and _pj != _esperado:
+                _imposibles.append(f"{e} ({_pj} PJ en la Anual, deberían ser {_esperado})")
+            elif _pt > 3 * _pj or _pj < 0 or _pt < 0:
+                _imposibles.append(f"{e} ({_pt} pts en {_pj} PJ)")
+        if _imposibles:
+            faltan.append("corregir la **Tabla Anual**: tiene valores imposibles — "
+                          + ", ".join(_imposibles[:3])
+                          + (f" y {len(_imposibles)-3} más" if len(_imposibles) > 3 else "")
+                          + ". Pegá la tabla oficial en «Otras formas de cargar»")
+        _pjs = sorted({int(d.get("pj", 0)) for d in annual.values()})
+        if len(_pjs) > 2:
+            faltan.append(f"revisar la **Tabla Anual**: los equipos tienen cantidades de partidos muy dispares "
+                          f"({_pjs[:5]}), lo que indica que se mezclaron datos de distintas fechas")
+    pend = (E or {}).get("pendientes") or []
+    det.append(f"Partidos pendientes: {len(pend)}")
+    if not pend:
+        faltan.append("el fixture de los partidos que faltan")
+    jug = (E or {}).get("jugados") or []
+    det.append(f"Resultados cargados: {len(jug)}")
+    if not jug:
+        faltan.append("los resultados partido a partido (forma, rachas y local/visitante quedan apagados)")
+    # coherencia PJ vs pendientes
+    try:
+        pj = {e: int(d.get("pj", 0)) for b in Z.values() for e, d in b.items()}
+        pend_por_eq = {}
+        for (l, v) in pend:
+            pend_por_eq[l] = pend_por_eq.get(l, 0) + 1
+            pend_por_eq[v] = pend_por_eq.get(v, 0) + 1
+        malos = [e for e in pj if pj[e] + pend_por_eq.get(e, 0) != LPF_FECHAS_TOTAL]
+        if malos:
+            faltan.append(f"coherencia entre partidos jugados y pendientes en {len(malos)} equipo(s): "
+                          f"{', '.join(malos[:4])}{'…' if len(malos) > 4 else ''}")
+    except Exception:
+        pass
+    nivel = "ok" if not faltan else "parcial"
+    return nivel, faltan, det
+
+def _rd_next_round(pend, fecha=None):
+    """Jornada en juego + sus partidos, INCLUYENDO los postergados de fechas
+    anteriores (se juegan en esta misma ventana y hay que poder cargarlos)."""
+    jornada, juegos, atrasados = lpf_jornada_actual(pend or [], forzar=fecha)
+    if jornada is None:
+        return None, []
+    return jornada, list(juegos) + [lv for lv, _f in atrasados]
+
+
+def _rd_update_stats(stats, gf, ga):
+    stats["pj"] = int(stats.get("pj", 0)) + 1
+    stats["gf"] = int(stats.get("gf", 0)) + int(gf)
+    stats["ga"] = int(stats.get("ga", 0)) + int(ga)
+    stats["dg"] = stats["gf"] - stats["ga"]
+    stats["pts"] = int(stats.get("pts", 0)) + (3 if gf > ga else 1 if gf == ga else 0)
+
+
+def _rd_apply_results(E, results):
+    """Aplica marcadores una sola vez y conserva una auditoría antes/después."""
+    import copy
+    Z = copy.deepcopy(E.get("zonas_lpf") or {})
+    annual = copy.deepcopy(E.get("anual_directo") or lpf_anual_base(Z, E.get("apertura") or {}))
+    pending = list(E.get("pendientes") or [])
+    played = list(E.get("jugados") or [])
+    before_zone = {lab: liga_tabla_df(base) for lab, base in Z.items()}
+    before_annual = liga_tabla_df(annual) if annual else pd.DataFrame()
+    applied = []
+
+    for local, visitor, gl, gv in results:
+        if (local, visitor) not in pending:
+            continue
+        for team, gf, ga in ((local, gl, gv), (visitor, gv, gl)):
+            for base in Z.values():
+                if team in base:
+                    _rd_update_stats(base[team], gf, ga)
+                    break
+            if team in annual:
+                _rd_update_stats(annual[team], gf, ga)
+        pending.remove((local, visitor))
+        played.append((local, visitor, int(gl), int(gv)))
+        applied.append((local, visitor, int(gl), int(gv)))
+
+    if not applied:
+        return 0
+
+    rest = {team: max(0, LPF_FECHAS_TOTAL - int(stats.get("pj", 0)))
+            for base in Z.values() for team, stats in base.items()}
+    # No se congela la Anual: si hay Apertura guardado, se recalcula sola desde las zonas
+    # ya actualizadas. Congelarla era lo que la dejaba vieja tras cada carga.
+    updated = dict(E, equipos=[team for base in Z.values() for team in base], zonas_lpf=Z,
+                   anual_directo=annual, pendientes=pending, rest=rest, jugados=played)
+    st.session_state.ESTADO = updated
+    st.session_state.LPF_ANUAL = annual
+
+    changes = []
+    for lab, base in Z.items():
+        old = {r["Equipo"]: int(r["Pos"]) for _, r in before_zone[lab].iterrows()}
+        new_df = liga_tabla_df(base)
+        for _, row in new_df.iterrows():
+            team = row["Equipo"]
+            if old.get(team) != int(row["Pos"]):
+                changes.append({"Tabla": f"Zona {lab}", "Equipo": team,
+                                "Antes": old.get(team), "Ahora": int(row["Pos"]),
+                                "Cambio": int(old.get(team, row["Pos"])) - int(row["Pos"])})
+    if not before_annual.empty:
+        old = {r["Equipo"]: int(r["Pos"]) for _, r in before_annual.iterrows()}
+        for _, row in liga_tabla_df(annual).iterrows():
+            team = row["Equipo"]
+            if old.get(team) != int(row["Pos"]):
+                changes.append({"Tabla": "Anual", "Equipo": team,
+                                "Antes": old.get(team), "Ahora": int(row["Pos"]),
+                                "Cambio": int(old.get(team, row["Pos"])) - int(row["Pos"])})
+    st.session_state.RD_LAST_CHANGES = pd.DataFrame(changes)
+    st.session_state.RD_LAST_RESULTS = applied
+    return len(applied)
+
+
+def _rd_tree_dot(team, objective, base, pending):
+    match = next(((l, v) for l, v in pending if team in (l, v)), None)
+    if not match:
+        return None
+    rival = match[1] if match[0] == team else match[0]
+    points = int(base.get(team, {}).get("pts", 0))
+    goal = {"Playoffs": "seguir en carrera por los playoffs",
+            "Libertadores": "pelear la Libertadores",
+            "Sudamericana": "pelear la Sudamericana",
+            "Descenso": "alejarse del descenso"}[objective]
+    return f'''digraph {{
+      graph [rankdir=LR, bgcolor="transparent", pad="0.2"];
+      node [shape=box, style="rounded,filled", fontname="Arial", color="#cbd5e1"];
+      start [label="{team}\n{points} puntos", fillcolor="#e2e8f0"];
+      win [label="Gana a {rival}\n{points + 3} puntos\nMejor impulso para {goal}", fillcolor="#dcfce7"];
+      draw [label="Empata con {rival}\n{points + 1} puntos\nSuma, pero deja pasar una chance", fillcolor="#fef3c7"];
+      lose [label="Pierde con {rival}\n{points} puntos\nQueda más atado a otros resultados", fillcolor="#fee2e2"];
+      start -> win [label=" G"];
+      start -> draw [label=" E"];
+      start -> lose [label=" P"];
+    }}'''
+
+
+def _rd_publication(team, objective, mode, exact_text, Z, annual, rest):
+    lab = lpf_zona_de_equipo(team, Z)
+    source = Z.get(lab, {}).get(team, {}) if objective == "Playoffs" else annual.get(team, {})
+    pts = int(source.get("pts", 0))
+    ceiling = pts + 3 * int(rest.get(team, 0))
+    action = "La previa" if mode == "Previa" else "El nuevo escenario"
+    title = f"{team}: {action.lower()} de su pelea por {objective.lower()}"
+    deck = (f"Tiene {pts} puntos y un techo de {ceiling}. La cuenta separa lo ya comprobable "
+            "de las probabilidades del simulador.")
+    return f"# {title}\n\n{deck}\n\n{exact_text}\n\n— Cuentas determinísticas con el fixture LPF 2026; las estimaciones se publican por separado."
+
+
+def render_newsroom(E):
+    Z = E.get("zonas_lpf") or {}
+    if len(Z) < 2:
+        st.warning("Cargá las dos zonas de la LPF para abrir la mesa de redacción.")
+        return
+    rest = E.get("rest") or {}
+    pending = E.get("pendientes") or []
+    annual = lpf_anual_base(Z, E.get("apertura") or {})
+    previous = st.session_state.get("PROMEDIOS") or {}
+    teams = sorted(E.get("equipos") or [team for base in Z.values() for team in base])
+    c1, c2, c3 = E.get("camps") or ("", "", "")
+    xl, xs = E.get("intl") or ("", "")
+    _jor, _jue, _atr = lpf_jornada_actual(pending or [])
+    _fechas_disp = sorted({f for _lv, f in _lpf_fecha_de(pending or []).items() if f is not None}) if pending else []
+    _sel = st.session_state.get("rd_fecha_sel")
+    if _sel not in _fechas_disp:
+        _sel = None
+    next_date, next_games = _rd_next_round(pending, fecha=_sel)
+    _jor2, _jue2, _atr2 = lpf_jornada_actual(pending or [], forzar=_sel)
+    _etq_jornada = lpf_etiqueta_jornada(_jor2, _atr2)
+    _con_atraso = lpf_equipos_con_atraso(pending or [])
+
+    st.subheader("Mesa de redacción")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Datos cargados", f"Fecha {next_date - 1}" if next_date else "Fase terminada")
+    m2.metric("Partidos pendientes", len(pending))
+    m3.metric("Tabla Anual", f"{len(annual)} equipos")
+    m4.metric("Regla", "LPF 2026 oficial")
+    _niv, _faltan, _det = lpf_chequeo_datos(E, annual, previous)
+    if _niv == "ok":
+        st.success("🟢 **Datos completos y coherentes.** " + " · ".join(_det))
+    else:
+        st.warning("🟡 **La carga quedó incompleta.** Falta: " + "; ".join(_faltan) +
+                   ".  \nPodés completarla desde **Cargar resultados** o volviendo a tocar **Cargar TODO** / **Actualizar a hoy**.")
+        with st.expander("Qué hay cargado ahora"):
+            for _d in _det:
+                st.markdown("- " + _d)
+    st.caption("EXACTO = cuenta determinística y verificable · ESTIMADO = simulación Monte Carlo rotulada como tal")
+
+    report_tab, preview_tab, load_tab, rules_tab = st.tabs(
+        ["Informe por equipo", "Previa de la fecha", "Cargar resultados", "Reglas y auditoría"])
+
+    with report_tab:
+        col_team, col_obj, col_mode = st.columns([1.4, 1, 0.8])
+        team = col_team.selectbox("Equipo", teams, index=teams.index("River Plate") if "River Plate" in teams else 0)
+        objective = col_obj.selectbox("Objetivo", ["Playoffs", "Libertadores", "Sudamericana", "Descenso"])
+        mode = col_mode.radio("Momento", ["Previa", "Post"], horizontal=True)
+        lab = lpf_zona_de_equipo(team, Z)
+
+        st.markdown("#### EXACTO · Qué se sabe y qué necesita")
+        if objective == "Playoffs":
+            exact = lpf_playoffs_texto(team, Z, rest, pending)
+            base = Z[lab]
+            cutoff = 8
+        elif objective in ("Libertadores", "Sudamericana"):
+            exact = lpf_copas_necesita_texto(team, Z, rest, E.get("apertura") or {},
+                                              (c1, c2, c3), (xl, xs), pending)
+            allocation = lpf_plazas_copas(Z, E.get("apertura") or {}, (c1, c2, c3), (xl, xs))
+            base = {name: annual[name] for name in allocation["reducida"]}
+            cutoff = allocation["n_tabla_lib"] + (0 if objective == "Libertadores" else 6)
+        else:
+            exact = lpf_descenso_texto(Z, rest, E.get("apertura") or {}, previous,
+                                       int(E.get("n_anual", 1)), int(E.get("n_prom", 1)), team, pending)
+            base = annual
+            cutoff = max(1, len(base) - 1)
+        st.markdown(exact)
+
+        with st.expander("🔍 Control rápido: ¿los datos coinciden con la tabla oficial?", expanded=(_niv != "ok")):
+            st.caption("Compará estas 6 líneas con Promiedos. Si no coinciden, los informes van a estar mal: "
+                       "cargá los resultados que faltan en la pestaña **Cargar resultados**.")
+            _cc1, _cc2 = st.columns(2)
+            with _cc1:
+                st.markdown("**Tabla Anual (top 6)**")
+                _ord_an = sorted(annual.items(), key=lambda kv: (-kv[1].get("pts", 0), -kv[1].get("dg", 0),
+                                                                 -kv[1].get("gf", 0)))
+                for _i, (_e, _d) in enumerate(_ord_an[:6], 1):
+                    st.markdown(f"{_i}. {_e} — **{_d.get('pts',0)}** pts ({_d.get('pj',0)} PJ, DG {_d.get('dg',0):+d})")
+            with _cc2:
+                st.markdown(f"**{team}**")
+                _p_an = 1 + sum(1 for _x, _d in annual.items() if _x != team and
+                                (_d.get("pts", 0), _d.get("dg", 0), _d.get("gf", 0)) >
+                                (annual.get(team, {}).get("pts", 0), annual.get(team, {}).get("dg", 0),
+                             annual.get(team, {}).get("gf", 0)))
+                _lab_z = lpf_zona_de_equipo(team, Z)
+                _bz = Z.get(_lab_z or "", {})
+                _p_z = 1 + sum(1 for _x, _d in _bz.items() if _x != team and
+                               (_d.get("pts", 0), _d.get("dg", 0), _d.get("gf", 0)) >
+                               (_bz.get(team, {}).get("pts", 0), _bz.get(team, {}).get("dg", 0),
+                            _bz.get(team, {}).get("gf", 0)))
+                st.markdown(f"- Anual: **{_p_an}º** con {annual.get(team, {}).get('pts', 0)} pts "
+                            f"({annual.get(team, {}).get('pj', 0)} PJ)")
+                if _bz:
+                    st.markdown(f"- Zona {_lab_z}: **{_p_z}º** con {_bz.get(team, {}).get('pts', 0)} pts "
+                                f"({_bz.get(team, {}).get('pj', 0)} PJ)")
+        if _niv != "ok":
+            st.error("🔴 **Este informe está calculado con datos incompletos o desactualizados, así que los números "
+                     "pueden ser incorrectos.** " + "Falta: " + "; ".join(_faltan) +
+                     ". Actualizá los datos antes de usar estas cuentas en una nota.")
+        if _con_atraso.get(team):
+            st.warning(f"⚠️ **{team} tiene {_con_atraso[team]} partido(s) pendiente(s) de fechas anteriores.** "
+                       f"Jugó menos que el resto: su lugar en la tabla se lee con esa salvedad (puede sumar de más) "
+                       f"y su promedio se calcula sobre los partidos que le corresponden.")
+        preview_text, preview_df = lpf_previa_equipo_texto(team, Z, rest, pending, annual, previous, fecha=_sel)
+        if preview_text:
+            st.info(preview_text)
+        if preview_df is not None:
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+        left, right = st.columns([1.25, 1])
+        with left:
+            st.markdown("#### Tabla de situación")
+            st.dataframe(_rd_competition_table(base, rest, cutoff), use_container_width=True,
+                         hide_index=True, height=460)
+        with right:
+            st.markdown("#### Árbol de la próxima decisión")
+            dot = _rd_tree_dot(team, objective, annual if objective != "Playoffs" else Z[lab], pending)
+            if dot:
+                st.graphviz_chart(dot, use_container_width=True)
+            else:
+                st.info("No hay un próximo partido pendiente para armar el árbol.")
+
+        st.markdown("#### ESTIMADO · Probabilidades por simulación")
+        calculate = st.toggle("Calcular ahora (8.000 temporadas)", key=f"rd_mc_{team}_{objective}")
+        if calculate:
+            if objective == "Playoffs":
+                probs = liga_probabilidades_df(Z[lab], rest, pending, LPF_ZONAS_PLAYOFF,
+                                                fuerza=_fuerza_lpf(Z[lab], E.get("jugados") or []))
+                st.dataframe(probs, use_container_width=True, hide_index=True)
+                st.caption(NOTA_MC_LIGA)
+            else:
+                ctx = _lpf_ctx(Z, rest, E.get("apertura") or {}, (c1, c2, c3), (xl, xs), previous,
+                               int(E.get("n_anual", 1)), int(E.get("n_prom", 1)))
+                obj = {"Libertadores": "libertadores", "Sudamericana": "sudamericana",
+                       "Descenso": "descenso"}[objective]
+                probs, note, headline = lpf_chances_obj(obj, ctx, pending, E.get("jugados") or [], destacar=team)
+                if headline:
+                    st.markdown(headline)
+                if probs is not None:
+                    st.dataframe(probs, use_container_width=True, hide_index=True)
+                st.caption(note or "Estimación no disponible.")
+        else:
+            st.caption("No se mezcla con el bloque exacto: activalo sólo cuando necesites una probabilidad publicable.")
+
+        publishable = _rd_publication(team, objective, mode, exact, Z, annual, rest)
+        with st.expander("Texto listo para copiar a la nota", expanded=False):
+            st.text_area("Titular + bajada + cuerpo", publishable, height=360, label_visibility="collapsed")
+            st.download_button("Descargar .md", publishable.encode("utf-8"),
+                               file_name=f"{_norm_club(team).replace(' ', '-')}-{objective.lower()}.md",
+                               mime="text/markdown")
+
+    with preview_tab:
+        st.markdown(f"#### {_etq_jornada}" if next_date else "#### No quedan fechas pendientes")
+        if _fechas_disp:
+            _cs1, _cs2 = st.columns([1, 3])
+            with _cs1:
+                st.selectbox("Ver fecha", ["Automático"] + [f"Fecha {f}" for f in _fechas_disp],
+                             key="rd_fecha_pick",
+                             index=0 if _sel is None else 1 + _fechas_disp.index(_sel),
+                             on_change=lambda: st.session_state.__setitem__(
+                                 "rd_fecha_sel",
+                                 None if st.session_state.get("rd_fecha_pick") == "Automático"
+                                 else int(str(st.session_state.get("rd_fecha_pick")).split()[-1])))
+            with _cs2:
+                if _atr2:
+                    st.info(f"Hay {len(_atr2)} partido(s) postergado(s) de fecha(s) anterior(es). "
+                            f"Los incluyo abajo, marcados como **Postergado**, porque se juegan en esta ventana.")
+        if next_games:
+            date, matches_df = lpf_previa_fecha_sim(Z, rest, pending, E.get("jugados") or [], fecha=_sel)
+            if matches_df is not None:
+                st.dataframe(matches_df, use_container_width=True, hide_index=True)
+                st.caption("ESTIMADO · Fuerza por puntos/partido, forma reciente, localía y probabilidad de empate.")
+        z1, z2 = st.columns(2)
+        for container, lab in zip((z1, z2), sorted(Z)):
+            with container:
+                st.markdown(f"##### Zona {lab}")
+                st.dataframe(_rd_competition_table(Z[lab], rest, 8), use_container_width=True,
+                             hide_index=True, height=520)
+        with st.expander("Cruces de octavos si terminara hoy"):
+            st.markdown(lpf_cruces_texto(Z))
+
+    with load_tab:
+        st.markdown("#### Carga rápida y recálculo inmediato")
+        st.caption("Marcá sólo los partidos terminados. El marcador actualiza Zona, Tabla Anual, promedios, forma y pendientes.")
+        if next_games:
+            with st.form("rd_results_form"):
+                captured = []
+                for index, (local, visitor) in enumerate(next_games):
+                    done, label, goals_l, goals_v = st.columns([0.45, 2.2, 0.65, 0.65])
+                    checked = done.checkbox("Final", key=f"rd_done_{index}")
+                    label.markdown(f"**{local} — {visitor}**")
+                    gl = goals_l.number_input("Local", 0, 20, 0, key=f"rd_gl_{index}", label_visibility="collapsed")
+                    gv = goals_v.number_input("Visita", 0, 20, 0, key=f"rd_gv_{index}", label_visibility="collapsed")
+                    if checked:
+                        captured.append((local, visitor, int(gl), int(gv)))
+                submitted = st.form_submit_button("Aplicar y recalcular", type="primary", use_container_width=True)
+            if submitted:
+                _hitos_antes = lpf_estado_hitos(Z, rest, pending, E.get("apertura") or {}, (c1, c2, c3), (xl, xs))
+                count = _rd_apply_results(E, captured)
+                if count:
+                    _E2 = st.session_state.get("ESTADO") or {}
+                    _Z2 = _E2.get("zonas_lpf") or Z
+                    _r2 = _E2.get("rest") or rest
+                    _p2 = _E2.get("pendientes") or []
+                    _hitos_ahora = lpf_estado_hitos(_Z2, _r2, _p2, _E2.get("apertura") or {}, (c1, c2, c3), (xl, xs))
+                    st.session_state["RD_HITOS"] = lpf_detectar_hitos(_hitos_antes, _hitos_ahora)
+                    st.success(f"Se aplicaron {count} resultados. Tablas, informes y simulaciones quedaron recalculados.")
+                    st.rerun()
+                else:
+                    st.warning("No marcaste partidos terminados o esos resultados ya estaban cargados.")
+        else:
+            st.success("No quedan partidos pendientes.")
+        _hitos = st.session_state.get("RD_HITOS") or []
+        if _hitos:
+            st.markdown("#### 🏁 Hitos de esta carga (noticias)")
+            for _h in _hitos:
+                (st.success if _h["tipo"] == "bueno" else st.error)(_h["texto"])
+            st.caption("EXACTO · Son cambios matemáticos de estado, no probabilidades. Cada uno se puede verificar en el informe del equipo.")
+        changes = st.session_state.get("RD_LAST_CHANGES")
+        if isinstance(changes, pd.DataFrame) and not changes.empty:
+            st.markdown("#### Qué cambió con la última carga")
+            st.dataframe(changes, use_container_width=True, hide_index=True)
+        _posibles = lpf_hitos_posibles(Z, rest, pending, E.get("apertura") or {}, (c1, c2, c3), (xl, xs), fecha=_sel)
+        if _posibles:
+            with st.expander("🔮 Qué se puede definir en esta fecha", expanded=False):
+                for _a in _posibles:
+                    st.markdown("- " + _a)
+                st.caption("EXACTO · Se puede dar si se combinan los resultados indicados.")
+
+    with rules_tab:
+        st.markdown("""
+#### Reglas confirmadas para 2026
+
+- Dos zonas de 15, 16 fechas y ocho clasificados por zona (arts. 14–17).
+- Desempate de zona: DG, GF, mano a mano, fair play y sorteo (art. 16).
+- Tabla General: sólo las fases de zonas del Apertura y Clausura (art. 24).
+- Dos descensos: último promedio y último de la Anual; si coincide, baja el siguiente peor de la Anual (Estatuto AFA, art. 93).
+- Un empate en una posición de descenso obliga a partido desempate (art. 26.2).
+- Libertadores: campeones de Apertura, Clausura y Copa Argentina, más tres por la Tabla General. Si Apertura y Clausura tienen el mismo campeón, se libera un lugar por tabla. La plaza duplicada de Copa Argentina se reasigna por esa Copa, no automáticamente por la Anual (art. 27).
+- Sudamericana: los seis mejores de la Tabla General que no tengan plaza en Libertadores (art. 28).
+
+#### Cómo leer las cuentas
+
+**Piso seguro:** supera la mayor línea todavía posible para el número de rivales relevante. La cota descuenta todos los cruces internos entre esos rivales y fue contrastada con enumeración exhaustiva en torneos pequeños. Puede ser conservadora; nunca debe prometer una garantía falsa.
+
+**Rango de una fecha:** es exacto por puntos y respeta los partidos entre rivales. Si hay igualdad, abre el intervalo porque el marcador futuro cambia DG/GF y todavía pueden intervenir mano a mano, fair play o sorteo.
+
+**Probabilidad:** siempre aparece bajo el rótulo ESTIMADO. Usa Monte Carlo sobre el fixture real; no decide ni alimenta una cuenta exacta.
+""")
+
+
+# ─── CONFIG DEL LLM EN EL PANEL LATERAL ──────────────────────────────────────────
+with st.sidebar:
+    st.divider()
+    st.subheader("🤖 Asistente (LLM)")
+    st.session_state.LLM_ON = st.toggle(
+        "Interpretar preguntas con Claude", value=st.session_state.LLM_ON,
+        help="Si lo activás, entiende preguntas más libres. Las cuentas siempre las hace el motor.")
+    if st.session_state.LLM_ON:
+        st.session_state.LLM_KEY = st.text_input(
+            "Anthropic API key", value=st.session_state.LLM_KEY, type="password", placeholder="sk-ant-...")
+        st.session_state.LLM_MODEL = st.text_input(
+            "Modelo", value=st.session_state.LLM_MODEL,
+            help="Ej.: claude-haiku-4-5 (rápido y barato), claude-sonnet-4-6, claude-opus-4-8.")
+        if not str(st.session_state.LLM_KEY).strip():
+            st.caption("Sin key, uso el router por palabras clave.")
+        if st.session_state.get("LLM_ERROR"):
+            st.warning(f"Último error del asistente: {st.session_state['LLM_ERROR']}")
+            st.caption("Si dice 'model'/'404', revisá el nombre del modelo. Si dice '401'/'authentication', es la API key. "
+                       "El chat funciona igual por palabras clave (escribí «ayuda»).")
+    if st.button("🧹 Limpiar conversación", use_container_width=True):
+        st.session_state.chat = [{"role": "assistant", "blocks": [("md", BIENVENIDA)]}]
+        st.rerun()
+
+
+_workspace = st.radio(
+    "Espacio de trabajo",
+    ["🗞️ Mesa de redacción", "💬 Chat avanzado"],
+    horizontal=True,
+    label_visibility="collapsed",
+    help="La mesa organiza informes, previas y carga de resultados. El chat conserva todos los comandos anteriores.",
+)
+if _workspace == "🗞️ Mesa de redacción":
+    render_newsroom(st.session_state.ESTADO)
+    st.stop()
+
+
+# ─── CHAT ────────────────────────────────────────────────────────────────────────
+modo = "🤖 con Claude" if (st.session_state.LLM_ON and str(st.session_state.LLM_KEY).strip()) else "🔤 por palabras clave"
+st.subheader(f"💬 Consultá los escenarios · {modo}")
+
+_gs_tot = _tour_grupos()
+if len(_gs_tot) > 1:
+    st.caption(f"✅ Tenés **{len(_gs_tot)} grupos** cargados ({', '.join(_gs_tot)}). "
+               "Preguntá por **cualquier** equipo: si es de otro grupo, cambio solo. "
+               "Probá «¿en qué zona está Belgrano?».")
+
+if "chat" not in st.session_state:
+    st.session_state.chat = [{"role": "assistant", "blocks": [("md", BIENVENIDA)]}]
+
+for _mi, msg in enumerate(st.session_state.chat):
+    with st.chat_message(msg["role"], avatar="⚽" if msg["role"] == "assistant" else None):
+        render_blocks(msg["blocks"], prefix=f"m{_mi}")
+
+if esc is not None and pendientes:
+    with st.expander("🎮 Simulador: ¿qué pasa si…?  (elegí resultados y mirá cómo queda)"):
+        _fixed = {}
+        for _i, (_l, _v) in enumerate(pendientes, 1):
+            _opt = st.selectbox(f"{_l} vs {_v}", ["— sin definir", f"Gana {_l}", "Empate", f"Gana {_v}"], key=f"sim{_i}")
+            if _opt == f"Gana {_l}":   _fixed[_i] = "L"
+            elif _opt == "Empate":     _fixed[_i] = "E"
+            elif _opt == f"Gana {_v}": _fixed[_i] = "V"
+        if _fixed:
+            _jugsim, _rem = aplicar_resultados(equipos, jugados, pendientes, _fixed)
+            st.dataframe(tabla(equipos, _jugsim), use_container_width=True, hide_index=True)
+            st.markdown(previa_condicional_texto(equipos, jugados, pendientes, esc, _fixed))
+        else:
+            st.caption("Elegí al menos un resultado para ver el efecto.")
+
+st.caption("Sugerencias rápidas:")
+if E.get("modo") == "lpf2026":
+    _e0 = equipos[0] if equipos else "River"
+    sug1 = ["Tabla de las dos zonas", f"¿Qué necesita {_e0} para los playoffs?", "Octavos hoy", "Tabla anual"]
+    sug2 = ["¿Cómo está el descenso?", "Copas 2027", f"¿{_e0} llega a la Libertadores?", "Ayuda"]
+elif E.get("modo") == "liga_tabla" or esc is None:
+    _e0 = equipos[0] if equipos else "River"
+    sug1 = ["Tabla", f"¿Qué necesita {_e0}?", "Proyección", "Promedios"]
+    sug2 = [f"Ficha de {_e0}", "Calendario", "Chances por zona", "Ayuda"]
+else:
+    sug1 = [f"¿Cómo viene {equipos[0]}?", f"¿Qué necesita {equipos[0]}?", "¿De quién depende?", "Si terminara hoy"]
+    sug2 = [f"Contame el escenario de {equipos[0]}", "Qué se juega cada equipo", "Partido bisagra", "Ayuda"]
+clic = None
+for fila in (sug1, sug2):
+    for c, s in zip(st.columns(len(fila)), fila):
+        if c.button(s, use_container_width=True, key=f"sug_{s}"):
+            clic = s
+
+prompt = st.chat_input("Preguntá: «¿qué necesita River para los playoffs?», «¿cómo está el descenso?», «copas 2027»…")
+consulta = prompt or clic
+if consulta:
+    st.session_state.chat.append({"role": "user", "blocks": [("md", consulta)]})
+    try:
+        bloques = responder(consulta)
+    except Exception as e:
+        bloques = [("error", f"Tuve un problema procesando esa consulta: {e}")]
+    st.session_state.chat.append({"role": "assistant", "blocks": bloques})
+    st.rerun()
