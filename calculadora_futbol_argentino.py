@@ -5639,7 +5639,11 @@ def lpf_previa_fecha_sim(Z, rest, pend, jugados=None, fecha=None):
     return prox, pd.DataFrame(rows)
 
 
-def lpf_previa_fecha_narrativa(Z, rest, pend, jugados=None, fecha=None, partido=None):
+def lpf_previa_fecha_narrativa(
+    Z, rest, pend, jugados=None, fecha=None, partido=None,
+    apertura=None, camps=("", "", ""), extras=("", ""), previous=None,
+    n_anual=1, n_prom=1, include_cups=True, include_relegation=True,
+):
     """Texto editorial breve para toda la fecha o para un encuentro puntual.
 
     Reutiliza la misma ventana que la pestaña de resultados: fecha oficial más
@@ -5657,6 +5661,12 @@ def lpf_previa_fecha_narrativa(Z, rest, pend, jugados=None, fecha=None, partido=
         for match in games
     }
     postponed_rounds = {match: round_number for match, round_number in postponed}
+    annual = lpf_anual_base(Z, apertura or {})
+    allocation = lpf_plazas_copas(Z, apertura or {}, camps, extras) if annual else {}
+    fixed = _lpf_fixed_lib_qualifiers(annual, camps, extras) if annual else []
+    averages = []
+    if annual and previous:
+        averages = promedios_df(annual, rest, previous).to_dict("records")
     return round_preview_story(
         Z,
         games,
@@ -5667,6 +5677,15 @@ def lpf_previa_fecha_narrativa(Z, rest, pend, jugados=None, fecha=None, partido=
         postponed_rounds=postponed_rounds,
         selected_match=partido,
         detailed=partido is not None,
+        annual=annual,
+        remaining=rest,
+        fixed_qualified=fixed,
+        table_slots_lib=int(allocation.get("n_tabla_lib") or 0),
+        averages=averages,
+        annual_relegations=int(n_anual),
+        average_relegations=int(n_prom),
+        include_cups=bool(include_cups),
+        include_relegation=bool(include_relegation),
     )
 
 def _sim_zone_pos(base, rest, pend, target, n, seed, forced=None,
@@ -7767,12 +7786,33 @@ def render_newsroom(E):
                             f"Los incluyo abajo, marcados como **Postergado**, porque se juegan en esta ventana.")
         if next_games:
             st.markdown("##### Narrativa para la previa")
-            _narrative_mode = st.radio(
-                "Alcance del relato",
-                ["Toda la fecha", "Un partido"],
-                horizontal=True,
-                key="rd_preview_narrative_mode",
-            )
+            _nm1, _nm2 = st.columns([1, 1.35])
+            with _nm1:
+                _narrative_mode = st.radio(
+                    "Alcance del relato",
+                    ["Toda la fecha", "Un partido"],
+                    horizontal=True,
+                    key="rd_preview_narrative_mode",
+                )
+            with _nm2:
+                _narrative_layers = st.multiselect(
+                    "Sumar al impacto de la zona",
+                    ["Copas", "Descenso"],
+                    default=["Copas", "Descenso"],
+                    key="rd_preview_narrative_layers",
+                    help=("Copas muestra sólo a los equipos que ocupan o están cerca de un cupo por la Tabla Anual. "
+                          "Descenso se limita a los últimos puestos de la Anual o de los promedios."),
+                )
+            _cups_ready, _cups_blocks = _lpf_domain_ready(E, "copas")
+            _desc_ready, _desc_blocks = _lpf_domain_ready(E, "descenso")
+            if "Copas" in _narrative_layers and not _cups_ready:
+                st.warning("La capa **Copas** no se agrega porque la Tabla Anual está bloqueada: "
+                           + "; ".join(issue.message for issue in _cups_blocks[:3]))
+            if "Descenso" in _narrative_layers and not _desc_ready:
+                st.warning("La capa **Descenso** no se agrega porque faltan datos consistentes de Anual o promedios: "
+                           + "; ".join(issue.message for issue in _desc_blocks[:3]))
+            if "Descenso" in _narrative_layers and not previous:
+                st.caption("La capa de descenso mostrará la Tabla Anual. Los promedios aparecerán cuando haya antecedentes válidos cargados.")
             _narrative_match = None
             if _narrative_mode == "Un partido":
                 _postponed_lookup = {match: round_number for match, round_number in _atr2}
@@ -7795,6 +7835,14 @@ def render_newsroom(E):
                 E.get("jugados") or [],
                 fecha=_sel,
                 partido=_narrative_match,
+                apertura=E.get("apertura") or {},
+                camps=E.get("camps") or ("", "", ""),
+                extras=E.get("intl") or ("", ""),
+                previous=previous,
+                n_anual=int(E.get("n_anual", 1)),
+                n_prom=int(E.get("n_prom", 1)),
+                include_cups="Copas" in _narrative_layers and _cups_ready,
+                include_relegation="Descenso" in _narrative_layers and _desc_ready,
             )
             st.markdown(_narrative_text)
 

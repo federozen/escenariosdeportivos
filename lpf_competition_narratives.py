@@ -199,6 +199,310 @@ def _round_result_branch(
     return f"**{team}:** " + "; ".join(labels) + "."
 
 
+def _objective_state(
+    team: str,
+    base: Mapping[str, Mapping[str, object]],
+    remaining: Mapping[str, int],
+    cutoff: int,
+) -> str:
+    """Estado matemático simple: adentro, afuera o en pelea.
+
+    Replica la cuenta exacta usada por la aplicación: compara el puntaje actual
+    con los techos de todos los rivales. No usa probabilidades ni proyecta DG.
+    """
+    if team not in base or cutoff <= 0:
+        return "out"
+    points = {name: _num(data.get("pts")) for name, data in base.items()}
+    ceilings = {
+        name: points[name] + 3 * max(0, _num(remaining.get(name, 0)))
+        for name in base
+    }
+    can_finish_above = sum(
+        1 for rival in base if rival != team and ceilings[rival] > points[team]
+    )
+    already_unreachable = sum(
+        1 for rival in base if rival != team and points[rival] > ceilings[team]
+    )
+    if can_finish_above < cutoff:
+        return "in"
+    if already_unreachable >= cutoff:
+        return "out"
+    return "pelea"
+
+
+def _result_rank_summary(
+    team: str,
+    base: Mapping[str, Mapping[str, object]],
+    games: Sequence[tuple[str, str]],
+    own_match: tuple[str, str],
+    *,
+    cutoff: int,
+    target_label: str,
+) -> str:
+    if team not in base or cutoff <= 0:
+        return ""
+    relevant_games = [match for match in games if match[0] in base or match[1] in base]
+    rows = exact_result_scenarios(base, relevant_games, team, own_match, cutoff)
+    if not rows:
+        return ""
+    parts = []
+    for row in rows:
+        best, worst = row.get("best_rank"), row.get("worst_rank")
+        if best is None or worst is None:
+            continue
+        rank = _rank_label(int(best), int(worst))
+        if bool(row.get("can_enter")) and not bool(row.get("can_fail")):
+            verdict = f"queda dentro de {target_label}"
+        elif not bool(row.get("can_enter")):
+            verdict = f"no alcanza {target_label} en esta ventana"
+        else:
+            verdict = f"puede quedar dentro o fuera de {target_label}"
+        parts.append(f"si {str(row.get('result', '')).lower()}, {rank} ({verdict})")
+    return "; ".join(parts)
+
+
+def _cup_result_rank_summary(
+    team: str,
+    base: Mapping[str, Mapping[str, object]],
+    games: Sequence[tuple[str, str]],
+    own_match: tuple[str, str],
+    *,
+    lib_cut: int,
+    sud_cut: int,
+    target: str,
+) -> str:
+    if team not in base or sud_cut <= 0:
+        return ""
+    relevant_games = [match for match in games if match[0] in base or match[1] in base]
+    rows = exact_result_scenarios(base, relevant_games, team, own_match, sud_cut)
+    parts: list[str] = []
+    for row in rows:
+        best, worst = row.get("best_rank"), row.get("worst_rank")
+        if best is None or worst is None:
+            continue
+        best_i, worst_i = int(best), int(worst)
+        rank = _rank_label(best_i, worst_i)
+        if target == "Libertadores":
+            if worst_i <= lib_cut:
+                verdict = "queda en zona de Libertadores"
+            elif best_i <= lib_cut:
+                verdict = "puede quedar dentro o fuera de Libertadores"
+            else:
+                verdict = "no llega a zona de Libertadores en esta ventana"
+        else:
+            if lib_cut > 0 and worst_i <= lib_cut:
+                verdict = "queda en zona de Libertadores"
+            elif best_i <= lib_cut and worst_i <= sud_cut:
+                verdict = "queda en puestos de copas y puede subir a Libertadores"
+            elif best_i > lib_cut and worst_i <= sud_cut:
+                verdict = "queda en zona de Sudamericana"
+            elif best_i <= sud_cut:
+                verdict = "puede quedar dentro o fuera de los puestos de copas"
+            else:
+                verdict = "queda fuera de los puestos de copas en esta ventana"
+        parts.append(f"si {str(row.get('result', '')).lower()}, {rank} ({verdict})")
+    return "; ".join(parts)
+
+
+def _cup_stake_for_team(
+    team: str,
+    annual: Mapping[str, Mapping[str, object]],
+    games: Sequence[tuple[str, str]],
+    own_match: tuple[str, str],
+    *,
+    remaining: Mapping[str, int],
+    fixed_qualified: Sequence[str],
+    table_slots_lib: int,
+    detailed: bool,
+) -> str:
+    if not annual or team not in annual or team in set(fixed_qualified):
+        return ""
+    all_rows = ordered_rows(annual)
+    raw_row = next((row for row in all_rows if row["team"] == team), None)
+    effective = [row for row in all_rows if row["team"] not in set(fixed_qualified)]
+    effective_base = {
+        str(row["team"]): annual[str(row["team"])]
+        for row in effective
+        if str(row["team"]) in annual
+    }
+    row = next((item for item in effective if item["team"] == team), None)
+    if row is None or raw_row is None:
+        return ""
+
+    lib_cut = max(0, int(table_slots_lib))
+    sud_cut = min(len(effective), lib_cut + 6)
+    pos = _num(row["pos"])
+    lib_state = _objective_state(team, effective_base, remaining, lib_cut) if lib_cut else "out"
+    sud_state = _objective_state(team, effective_base, remaining, sud_cut) if sud_cut else "out"
+
+    # Filtro editorial: no alcanza con una posibilidad remota al comienzo del
+    # torneo. Se muestran los que ya ocupan un cupo o están cerca de una línea.
+    lib_boundary = effective[lib_cut - 1] if 0 < lib_cut <= len(effective) else None
+    sud_boundary = effective[sud_cut - 1] if 0 < sud_cut <= len(effective) else None
+    lib_gap = max(0, _num(lib_boundary["pts"]) - _num(row["pts"])) if lib_boundary else 999
+    sud_gap = max(0, _num(sud_boundary["pts"]) - _num(row["pts"])) if sud_boundary else 999
+    late_stage = max(0, _num(remaining.get(team, 0))) <= 6
+    near_lib = lib_cut > 0 and lib_state != "out" and (
+        pos <= lib_cut + 4 or (late_stage and lib_gap <= 6)
+    )
+    near_sud = sud_cut > 0 and sud_state != "out" and (
+        pos <= sud_cut + 4 or (late_stage and sud_gap <= 6)
+    )
+    if not near_lib and not near_sud:
+        return ""
+
+    if lib_cut and pos <= lib_cut:
+        target = "Libertadores"
+        status = "hoy ocupa un cupo de Libertadores por la Tabla Anual"
+    elif near_lib:
+        target = "Libertadores"
+        status = (
+            "ya aseguró terminar en zona de Libertadores por la Anual"
+            if lib_state == "in"
+            else (
+                "sigue en carrera por la Libertadores; está igualado en puntos con el último cupo y hoy queda afuera por desempate"
+                if lib_gap == 0
+                else f"sigue en carrera por la Libertadores; está a {lib_gap} punto{'s' if lib_gap != 1 else ''} del último cupo"
+            )
+        )
+    elif pos <= sud_cut:
+        target = "Sudamericana"
+        status = "hoy ocupa un cupo de Sudamericana por la Tabla Anual"
+    else:
+        target = "Sudamericana"
+        status = (
+            "ya aseguró terminar en zona de Sudamericana por la Anual"
+            if sud_state == "in"
+            else (
+                "sigue en carrera por la Sudamericana; está igualado en puntos con el último cupo y hoy queda afuera por desempate"
+                if sud_gap == 0
+                else f"sigue en carrera por la Sudamericana; está a {sud_gap} punto{'s' if sud_gap != 1 else ''} del último cupo"
+            )
+        )
+
+    text = (
+        f"**Copas — {team}:** está {raw_row['pos']}º en la Anual y {pos}º entre los equipos elegibles; {status}."
+    )
+    bounds = next_round_rank_bounds(team, effective_base, [m for m in games if m[0] in effective_base or m[1] in effective_base])
+    if bounds:
+        text += f" En esta ventana puede cerrar {_rank_label(bounds[0], bounds[1])} entre los elegibles."
+    if detailed:
+        branch = _cup_result_rank_summary(
+            team,
+            effective_base,
+            games,
+            own_match,
+            lib_cut=lib_cut,
+            sud_cut=sud_cut,
+            target=target,
+        )
+        if branch:
+            text += " " + branch[:1].upper() + branch[1:] + "."
+    return text
+
+
+def _sorted_average_rows(averages: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    return [
+        dict(row)
+        for row in sorted(
+            averages,
+            key=lambda item: float(item.get("PROMEDIO", 0) or 0),
+            reverse=True,
+        )
+    ]
+
+
+def _relegation_stake_for_team(
+    team: str,
+    annual: Mapping[str, Mapping[str, object]],
+    averages: Sequence[Mapping[str, object]],
+    games: Sequence[tuple[str, str]],
+    own_match: tuple[str, str],
+    *,
+    annual_relegations: int,
+    average_relegations: int,
+    detailed: bool,
+) -> str:
+    notes: list[str] = []
+    annual_rows = ordered_rows(annual) if annual else []
+    annual_row = next((row for row in annual_rows if row["team"] == team), None)
+    annual_count = max(0, int(annual_relegations))
+    annual_window = max(5, annual_count + 4)
+    annual_drop_now = bool(
+        annual_row and annual_count and _num(annual_row["pos"]) > len(annual_rows) - annual_count
+    )
+    if annual_row and annual_count and _num(annual_row["pos"]) > max(0, len(annual_rows) - annual_window):
+        safe_pos = max(1, len(annual_rows) - annual_count)
+        first_drop_pos = min(len(annual_rows), safe_pos + 1)
+        safe_row = annual_rows[safe_pos - 1]
+        drop_row = annual_rows[first_drop_pos - 1]
+        pos = _num(annual_row["pos"])
+        if pos > safe_pos:
+            gap = max(0, _num(safe_row["pts"]) - _num(annual_row["pts"]))
+            situation = f"está en zona de descenso anual, a {gap} punto{'s' if gap != 1 else ''} del último puesto de salvación"
+        else:
+            cushion = max(0, _num(annual_row["pts"]) - _num(drop_row["pts"]))
+            situation = f"está {cushion} punto{'s' if cushion != 1 else ''} por encima de la zona de descenso anual"
+        text = f"**Anual — {team}:** está {pos}º con {_pts(annual_row['pts'])} y {situation}."
+        bounds = next_round_rank_bounds(team, annual, games)
+        if bounds:
+            text += f" Puede cerrar la ventana {_rank_label(bounds[0], bounds[1])}."
+        if detailed:
+            branch = _result_rank_summary(
+                team, annual, games, own_match, cutoff=safe_pos,
+                target_label="la zona de permanencia anual",
+            )
+            if branch:
+                text += " " + branch[:1].upper() + branch[1:] + "."
+        notes.append(text)
+
+    avg_rows = _sorted_average_rows(averages)
+    avg_count = max(0, int(average_relegations))
+    avg_window = max(5, avg_count + 4)
+    avg_index = next((index for index, row in enumerate(avg_rows) if row.get("Equipo") == team), None)
+    avg_drop_now = bool(
+        avg_index is not None and avg_count and avg_index + 1 > len(avg_rows) - avg_count
+    )
+    if avg_index is not None and avg_count and avg_index + 1 > max(0, len(avg_rows) - avg_window):
+        row = avg_rows[avg_index]
+        pos = avg_index + 1
+        avg = float(row.get("PROMEDIO", 0) or 0)
+        safe_index = max(0, len(avg_rows) - avg_count - 1)
+        safe_avg = float(avg_rows[safe_index].get("PROMEDIO", 0) or 0) if avg_rows else 0.0
+        if pos > len(avg_rows) - avg_count:
+            situation = f"hoy está en zona de descenso por promedios, a {max(0.0, safe_avg - avg):.3f} del último que se salva"
+        else:
+            relegated_index = max(0, len(avg_rows) - avg_count)
+            relegated_avg = float(avg_rows[relegated_index].get("PROMEDIO", 0) or 0) if relegated_index < len(avg_rows) else avg
+            situation = f"está {max(0.0, avg - relegated_avg):.3f} por encima de la zona de descenso por promedios"
+        pts = _num(row.get("Pts"))
+        played = _num(row.get("PJ"))
+        text = f"**Promedios — {team}:** está {pos}º con {avg:.3f}; {situation}."
+        if played >= 0:
+            after = {
+                "gana": (pts + 3) / (played + 1) if played + 1 else 0.0,
+                "empata": (pts + 1) / (played + 1) if played + 1 else 0.0,
+                "pierde": pts / (played + 1) if played + 1 else 0.0,
+            }
+            text += (
+                f" Tras este partido quedaría en {after['gana']:.3f} si gana, "
+                f"{after['empata']:.3f} si empata y {after['pierde']:.3f} si pierde."
+            )
+            if sum(team in match for match in games) > 1:
+                text += " Esos valores son antes de su otro partido pendiente en la misma ventana."
+        notes.append(text)
+
+    if annual_drop_now and avg_drop_now:
+        notes.insert(
+            0,
+            f"**Doble riesgo — {team}:** hoy está en zona de descenso en las dos tablas; "
+            "si terminara así, bajaría por promedios y la plaza de la Anual pasaría al siguiente peor "
+            "equipo que no haya descendido ya por esa vía.",
+        )
+
+    return " ".join(notes)
+
+
 def round_preview_story(
     zones: Mapping[str, Mapping[str, Mapping[str, object]]],
     games: Sequence[tuple[str, str]],
@@ -210,6 +514,15 @@ def round_preview_story(
     postponed_rounds: Mapping[tuple[str, str], int] | None = None,
     selected_match: tuple[str, str] | None = None,
     detailed: bool = False,
+    annual: Mapping[str, Mapping[str, object]] | None = None,
+    remaining: Mapping[str, int] | None = None,
+    fixed_qualified: Sequence[str] = (),
+    table_slots_lib: int = 0,
+    averages: Sequence[Mapping[str, object]] = (),
+    annual_relegations: int = 1,
+    average_relegations: int = 1,
+    include_cups: bool = False,
+    include_relegation: bool = False,
 ) -> str:
     """Narrativa breve para toda una fecha o para un partido puntual.
 
@@ -222,6 +535,8 @@ def round_preview_story(
     match_types = dict(match_types or {})
     probabilities = dict(probabilities or {})
     postponed_rounds = dict(postponed_rounds or {})
+    annual = dict(annual or {})
+    remaining = dict(remaining or {})
     appearances = {team: sum(team in match for match in games) for base in zones.values() for team in base}
 
     def match_order(match: tuple[str, str]) -> tuple[object, ...]:
@@ -261,8 +576,8 @@ def round_preview_story(
         vr = visitor_snapshot["row"]
         paragraph = [f"**{local} – {visitor} ({type_label}{timing}).**"]
         paragraph.append(
-            f"{local} llega {lr['pos']}º de la Zona {local_snapshot['zone']} con {lr['pts']} pts y DG {_signed(lr['dg'])}; "
-            f"{visitor}, {vr['pos']}º de la Zona {visitor_snapshot['zone']} con {vr['pts']} pts y DG {_signed(vr['dg'])}."
+            f"{local} llega {lr['pos']}º de la Zona {local_snapshot['zone']} con {_pts(lr['pts'])} y DG {_signed(lr['dg'])}; "
+            f"{visitor}, {vr['pos']}º de la Zona {visitor_snapshot['zone']} con {_pts(vr['pts'])} y DG {_signed(vr['dg'])}."
         )
         paragraph.append(_round_match_hook(local_snapshot, visitor_snapshot, cutoff=cutoff))
 
@@ -285,6 +600,37 @@ def round_preview_story(
                 paragraph.append(prob_sentence)
         blocks.append(" ".join(part for part in paragraph if part))
 
+        stakes: list[str] = []
+        for team in (local, visitor):
+            if include_cups:
+                cup = _cup_stake_for_team(
+                    team,
+                    annual,
+                    games,
+                    (local, visitor),
+                    remaining=remaining,
+                    fixed_qualified=fixed_qualified,
+                    table_slots_lib=table_slots_lib,
+                    detailed=detailed,
+                )
+                if cup:
+                    stakes.append(cup)
+            if include_relegation:
+                relegation = _relegation_stake_for_team(
+                    team,
+                    annual,
+                    averages,
+                    games,
+                    (local, visitor),
+                    annual_relegations=annual_relegations,
+                    average_relegations=average_relegations,
+                    detailed=detailed,
+                )
+                if relegation:
+                    stakes.append(relegation)
+        if stakes:
+            blocks.append("**También se juega:**\n" + "\n".join(f"- {stake}" for stake in stakes))
+
         if detailed:
             local_branch = _round_result_branch(
                 local, local_snapshot["base"], games, (local, visitor), cutoff=cutoff
@@ -306,6 +652,12 @@ def round_preview_story(
         blocks.append(
             "_El rango de puesto es exacto por puntos para los equipos que disputan un solo partido en la ventana. "
             "Las probabilidades son una estimación separada y no modifican las cuentas._"
+        )
+    if (include_cups or include_relegation) and annual:
+        blocks.append(
+            "_Los cupos se leen sobre la Tabla Anual vigente y entre equipos elegibles. Los títulos que todavía no se "
+            "definieron pueden hacer correr la línea. En promedios se muestra el efecto exacto del resultado sobre el "
+            "coeficiente propio, no una posición futura asegurada._"
         )
     return "\n\n".join(blocks)
 

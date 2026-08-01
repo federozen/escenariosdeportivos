@@ -1,3 +1,14 @@
+## 3.5
+
+- Integró el impacto en copas y descenso dentro de **Mesa de redacción → Previa de la fecha**.
+- Agregó el selector de capas **Copas / Descenso** para la vista general y la vista por partido.
+- Copas informa puesto anual, puesto entre elegibles, cupo vigente, distancia a la línea y rango de la ventana.
+- La vista individual diferencia qué ocurre si gana, empata o pierde: Libertadores, Sudamericana, puestos de copas o fuera de ellos.
+- Descenso anual se limita a los últimos puestos y muestra distancia a la salvación y rangos exactos.
+- Promedios se limita a la zona baja y calcula el coeficiente exacto posterior a cada resultado.
+- Si faltan antecedentes válidos, se omite la capa de promedios sin inventar datos.
+- Total de la entrega: 25 tests automatizados aprobados.
+
 ## 3.4
 
 - Agregó un pantallazo narrativo de la fecha completa dentro de **Mesa de redacción → Previa de la fecha**.
