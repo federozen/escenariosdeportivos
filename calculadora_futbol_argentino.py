@@ -692,7 +692,7 @@ def liga_aseg_df(base, rest, n):
     pts = {e: base[e]["pts"] for e in base}; pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
     rows = []
     for e in base:
-        arriba = sum(1 for x in base if x != e and pmax[x] > pts[e])
+        arriba = sum(1 for x in base if x != e and pmax[x] >= pts[e])
         inalc = sum(1 for x in base if x != e and pts[x] > pmax[e])
         estado = "🟢 asegurado" if arriba < n else ("🔴 sin chances" if inalc >= n else "🟡 depende")
         rows.append({"Equipo": e, "PTS": pts[e], "PTS máx": pmax[e], f"Top {n}": estado})
@@ -716,7 +716,7 @@ def zona_target(zonas, texto):
 
 def _liga_in_out(equipo, base, rest, k):
     pts = {e: base[e]["pts"] for e in base}; pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
-    arriba = sum(1 for x in base if x != equipo and pmax[x] > pts[equipo])
+    arriba = sum(1 for x in base if x != equipo and pmax[x] >= pts[equipo])
     inalc = sum(1 for x in base if x != equipo and pts[x] > pmax[equipo])
     if arriba < k: return "in"
     if inalc >= k: return "out"
@@ -788,7 +788,7 @@ def liga_que_necesita_texto(equipo, base, rest, zonas, texto, pend=None):
         return f"¿Para qué zona? Configurá las zonas en el panel y preguntá, por ej., «qué necesita {equipo} para Libertadores». Zonas activas: {nombres}."
     k, nombre = tgt
     gx = rest.get(equipo, 0); meta = "no descender" if nombre == "no descender" else f"entrar a {nombre}"
-    arriba = sum(1 for x in base if x != equipo and pmax[x] > pts[equipo])
+    arriba = sum(1 for x in base if x != equipo and pmax[x] >= pts[equipo])
     inalc = sum(1 for x in base if x != equipo and pts[x] > pmax[equipo])
     otros = sorted((pmax[x] for x in base if x != equipo), reverse=True)
     L = [f"**¿Qué necesita {equipo} para {meta}?**",
@@ -839,12 +839,12 @@ def _porque_liga(equipo, base, rest, zonas, texto, pend=None):
         return None
     k, nombre = tgt
     pts = {e: base[e]["pts"] for e in base}; pmax = {e: pts[e] + 3 * rest.get(e, 0) for e in base}
-    arriba = sum(1 for x in base if x != equipo and pmax[x] > pts[equipo])
+    arriba = sum(1 for x in base if x != equipo and pmax[x] >= pts[equipo])
     inalc = sum(1 for x in base if x != equipo and pts[x] > pmax[equipo])
     g = rest.get(equipo, 0)
     if arriba < k:
-        pueden = sorted([x for x in base if x != equipo and pmax[x] > pts[equipo]], key=lambda x: -pmax[x])
-        cuales = f"solo {', '.join(pueden)} pueden terminar por encima" if pueden else "nadie puede terminar por encima"
+        pueden = sorted([x for x in base if x != equipo and pmax[x] >= pts[equipo]], key=lambda x: -pmax[x])
+        cuales = f"solo {', '.join(pueden)} pueden igualar o superar ese puntaje" if pueden else "nadie puede igualar o superar ese puntaje"
         return (f"aunque {equipo} pierda todo lo que le queda (se queda en {pts[equipo]}), {cuales}; como entran {k}, ya está adentro.")
     if inalc >= k:
         arr = sorted([x for x in base if x != equipo and pts[x] > pmax[equipo]], key=lambda x: -pts[x])
@@ -890,9 +890,9 @@ def _porque_liga(equipo, base, rest, zonas, texto, pend=None):
 def _porque_numero_magico(equipo, eqs, jug, pen, n):
     ov = _stats(eqs, jug); rest = _restantes(eqs, pen)
     pts = {e: ov[e]["pts"] for e in eqs}; pmax = {e: pts[e] + 3 * rest[e] for e in eqs}
-    arriba = sum(1 for x in eqs if x != equipo and pmax[x] > pts[equipo])
+    arriba = sum(1 for x in eqs if x != equipo and pmax[x] >= pts[equipo])
     if arriba < n:
-        return f"aunque {equipo} no sume más, solo {arriba} pueden quedar por encima y entran {n}."
+        return f"aunque {equipo} no sume más, solo {arriba} pueden igualar o superar ese puntaje y entran {n}."
     otros = sorted(((x, pmax[x]) for x in eqs if x != equipo), key=lambda kv: -kv[1])
     rt, rm = otros[n-1]
     return (f"el {n}º que más puede llegar es {rt} (tope {rm}); para asegurarte tenés que pasarlo ({rm+1}) "
@@ -2638,29 +2638,55 @@ def _combos_puntos(faltan, juegos):
     out.sort(key=lambda ge: (ge[0], ge[1]))
     return out
 
+def _texto_cantidad(n, singular, plural=None):
+    plural = plural or f"{singular}s"
+    return f"{n} {singular if n == 1 else plural}"
+
+
+def _minimo_puntos_alcanzable(faltan, juegos):
+    """Menor suma realizable en `juegos` partidos que alcanza o supera `faltan`."""
+    cs = _combos_puntos(faltan, juegos)
+    return min((3 * g + e for g, e in cs), default=None)
+
+
 def _texto_combos(faltan, juegos):
     cs = _combos_puntos(faltan, juegos)
     if not cs:
         return ""
     g0, e0 = cs[0]
-    total0 = 3 * g0 + e0
     partes = []
     for g, e in cs[:3]:
         p = f"**{g} triunfo{'s' if g != 1 else ''}**"
         if e:
             p += f" + {e} empate{'s' if e != 1 else ''}"
         pierde = juegos - g - e
-        p += f" y {pierde} derrota{'s' if pierde != 1 else ''}" if pierde > 0 else " (gana o empata todos)"
+        if pierde > 0:
+            p += f" y {pierde} derrota{'s' if pierde != 1 else ''}"
+        elif g == juegos:
+            p += " (gana todos)"
+        elif e == juegos:
+            p += " (empata todos)"
+        else:
+            p += " (gana o empata todos)"
         p += f" = {3*g + e}"
         partes.append(p)
     txt = "**Cómo llegar** (sirve alcanzar la meta *o superarla*): " + " · ".join(partes) + "."
     margen = juegos - g0 - e0
     if margen == 0:
-        txt += (" Con el mínimo de triunfos no le sobra ningún partido; ganando alguno más sí puede permitirse "
-                "una derrota.") if len(cs) > 1 else " No le sobra ningún partido: tiene que puntuar en todos."
+        if len(cs) > 1:
+            txt += (" Con el mínimo de triunfos no le sobra ningún partido; ganando alguno más sí puede permitirse "
+                    "una derrota.")
+        elif g0 == juegos:
+            txt += " No tiene margen para empatar ni perder: debe ganar todos."
+        elif e0 == juegos:
+            txt += " No tiene margen para perder: debe empatar todos."
+        else:
+            txt += " No le sobra ningún partido: debe ganar o empatar todos."
     return txt
 
-def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="entrar"):
+
+def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="entrar",
+                            cupos_reales=None, nota_desempate=""):
     """Un objetivo explicado con la cuenta a la vista y las condiciones concretas.
     `modo`: "entrar" (playoffs/copas) o "salvarse" (descenso), sólo cambia el lenguaje."""
     _salva = (modo == "salvarse")
@@ -2692,45 +2718,75 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
         except Exception:
             _ladder = None
     faltan = max(0, meta - mio)
+    suma_alcanzable = _minimo_puntos_alcanzable(faltan, gx)
+    meta_alcanzable = mio + suma_alcanzable if suma_alcanzable is not None else None
     L = []
     pmax = {x: pts[x] + 3 * rest.get(x, 0) for x in base_red}
-    arriba_techo = sorted([(x, pmax[x]) for x in base_red if x != equipo and pmax[x] > techo],
-                          key=lambda kv: -kv[1])
+    amenazas_techo = sorted(
+        [(x, pmax[x]) for x in base_red if x != equipo and pmax[x] >= techo],
+        key=lambda kv: (-kv[1], -pts[kv[0]], kv[0]),
+    )
     if faltan > 3 * gx:
         # ── No le alcanza solo: hay que decir QUÉ tienen que hacer los otros ──
         L.append(f"### ⚠️ {nombre_obj}: no le alcanza con ganar todo")
+        diferencia = meta - techo
         L.append(f"**La cuenta:** tiene {mio} puntos y le quedan {gx} partidos. Ganándolos todos llega a "
-                 f"**{techo}**. Para {_VINF} sin depender de nadie necesitaría **{meta}**. Le faltan {meta - techo} "
-                 f"puntos que ya no existen: por eso necesita ayuda.")
-        ceden = max(0, len(arriba_techo) - (k - 1))
-        if arriba_techo:
-            lst = " · ".join(f"{x} (puede llegar a {m})" for x, m in arriba_techo[:6])
-            L.append(f"**La condición:** aun ganando todo terminaría con {techo}. Hay **{len(arriba_techo)} equipos** "
-                     f"que todavía pueden superar ese número: {lst}.")
-            L.append((f"Como se salvan {k}, " if _salva else f"Como a {nombre_obj} entran {k}, ") +
-                     f"necesita que **al menos {ceden} de ellos** terminen en {techo} o menos. "
-                     f"Es decir: ganar lo suyo y que esos rivales pierdan puntos en el camino.")
+                 f"**{techo}**. Para {_VINF} sin depender de nadie necesitaría **{meta}**. "
+                 f"Le {'falta' if diferencia == 1 else 'faltan'} {_texto_cantidad(diferencia, 'punto')} "
+                 f"que ya no {'existe' if diferencia == 1 else 'existen'}: por eso necesita ayuda.")
+        ceden = max(0, len(amenazas_techo) - (k - 1))
+        if amenazas_techo:
+            limite = 12
+            muestra = amenazas_techo[:limite]
+            lst = " · ".join(
+                f"{x} ({pts[x]} pts, {rest.get(x, 0)} por jugar, tope {m})" for x, m in muestra
+            )
+            if len(amenazas_techo) > limite:
+                lst += f" · y {len(amenazas_techo) - limite} más"
+            L.append(f"**La condición:** aun ganando todo terminaría con {techo}. Hay "
+                     f"**{len(amenazas_techo)} equipos** que todavía pueden alcanzar o superar ese número: {lst}.")
+            if _salva:
+                prefijo = f"Como se salvan {k}, "
+            elif cupos_reales is not None and cupos_reales != k:
+                prefijo = (f"Como {nombre_obj} entrega {cupos_reales} cupos y el último queda en el "
+                           f"**{k}º puesto elegible** de esta tabla, ")
+            else:
+                prefijo = f"Como por esta tabla entran {k} a {nombre_obj}, "
+            L.append(prefijo +
+                     f"necesita que **al menos {ceden} de ellos queden detrás de {equipo}** en la clasificación final. "
+                     "Es decir: ganar lo suyo y que esos rivales pierdan puntos o queden por debajo en el desempate.")
+            if nota_desempate:
+                L.append(nota_desempate)
     else:
         # ── Depende de sí mismo: mostrar las combinaciones ──
         L.append(f"### 🎯 {nombre_obj}: depende de sí mismo")
-        L.append(f"**La cuenta:** tiene {mio} puntos y necesita llegar a **{meta}**. "
-                 f"Le faltan **{faltan} puntos** de los {3*gx} que quedan en juego ({gx} partidos).")
+        if meta_alcanzable is not None and meta_alcanzable != meta:
+            L.append(f"**La cuenta:** tiene {mio} puntos y la garantía matemática está en **{meta}**. "
+                     f"Como no puede terminar exactamente con {meta} en {gx} partidos, el menor total alcanzable "
+                     f"que supera esa línea es **{meta_alcanzable}**.")
+        else:
+            L.append(f"**La cuenta:** tiene {mio} puntos y necesita llegar a **{meta}**. "
+                     f"Le faltan **{faltan} puntos** de los {3*gx} que quedan en juego ({gx} partidos).")
         cb = _texto_combos(faltan, gx)
         if cb:
             L.append(cb)
-        L.append(f"Con {meta} {_V} **pase lo que pase**. Con menos también puede {_VINF}, pero ahí ya depende de que "
+        meta_segura = meta_alcanzable if meta_alcanzable is not None else meta
+        L.append(f"Con {meta_segura} {_V} **pase lo que pase**. Con menos también puede {_VINF}, pero ahí ya depende de que "
                  f"los rivales se queden cortos.")
     # ── De dónde sale la meta (el porqué, pegado al número) ──
-    _quien = (f"el último equipo que se salva ({k}º)" if _salva else f"el equipo que quede {k}º")
     if _guarantee_exact:
-        L.append(f"**De dónde sale el {meta}:** el motor exacto probó el fixture pendiente y encontró que con "
-                 f"**{meta}** no existe ninguna combinación capaz de dejar a {equipo} fuera. Los partidos entre "
-                 "rivales y los partidos del propio equipo se resuelven como un único sistema.")
+        L.append(f"**De dónde sale el {meta}:** el motor exacto probó el fixture pendiente y encontró que al "
+                 f"**alcanzar o superar {meta}** no existe ninguna combinación capaz de dejar a {equipo} fuera. "
+                 "Los partidos entre rivales y los partidos del propio equipo se resuelven como un único sistema.")
     else:
+        extra_alcanzable = ""
+        if meta_alcanzable is not None and meta_alcanzable != meta:
+            extra_alcanzable = (f" Como {meta} no es un total alcanzable con {gx} partidos, el primer total posible "
+                                f"que supera la garantía es {meta_alcanzable}.")
         L.append(f"**De dónde sale el {meta}:** es una **garantía conservadora**. La cuenta descuenta los cruces "
                  "entre rivales para no sumar puntos incompatibles, pero todavía puede pedir algún punto de más. "
-                 f"Con **{meta}** entra seguro; el mínimo exacto puede ser menor y se calcula en el Radar cuando "
-                 "quedan seis fechas o menos.")
+                 f"Alcanzar o superar **{meta}** asegura la clasificación.{extra_alcanzable} El mínimo exacto puede "
+                 "ser menor y se calcula en el Radar cuando quedan seis fechas o menos.")
     if _ladder and _ladder.get("available") and _ladder.get("rows"):
         _rows = _ladder["rows"]
         _conditioned = [row for row in _rows if not row.guaranteed]
@@ -2746,8 +2802,11 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
     otros = sorted(((x, pmax[x]) for x in base_red if x != equipo), key=lambda kv: -kv[1])
     lo = max(0, k - 3); borde = otros[lo:k + 2]
     if borde:
-        L.append("**Con quién pelea el corte:** " +
-                 " · ".join(f"{x} {pts[x]} {'pt' if pts[x] == 1 else 'pts'} (tope {m})" for x, m in borde) + ".")
+        L.append("**Rivales con los mayores topes alrededor de la línea:** " +
+                 " · ".join(
+                     f"{x} {pts[x]} {'pt' if pts[x] == 1 else 'pts'} "
+                     f"({rest.get(x, 0)} por jugar, tope {m})" for x, m in borde
+                 ) + ".")
     if pend:
         enpelea = {x for x in base_red if x != equipo and _liga_in_out(x, base_red, rest, k) == "pelea"}
         h2h = [(b if a == equipo else a) for (a, b) in pend if equipo in (a, b) and (b if a == equipo else a) in enpelea]
@@ -2788,25 +2847,35 @@ def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""),
 
     # ── TITULAR: la conclusión primero ──
     if e_lib == "in":
-        titular = f"{equipo} ya tiene la Libertadores asegurada."
+        titular = f"Por la Tabla General, {equipo} ya tiene la Libertadores asegurada."
     elif e_lib == "out" and e_sud == "out":
-        titular = f"{equipo} quedó sin chances de copa por la Tabla General."
+        titular = f"Por la Tabla General, {equipo} quedó sin chances de copa."
     elif e_lib == "out":
-        titular = f"{equipo} ya no llega a la Libertadores: su pelea es por la Sudamericana."
+        titular = f"Por la Tabla General, {equipo} ya no llega a la Libertadores: su pelea es por la Sudamericana."
     else:
         _lin = _linea_garantia(base_red, rest, pend, equipo, k_lib)
         if (_lin + 1 - pts_e) > 3 * gx:
-            titular = (f"{equipo} no puede asegurar solo la Libertadores: necesita ganar y que los de arriba pinchen. "
-                       f"Su objetivo realista es la Sudamericana.")
+            titular = (f"Por la Tabla General, {equipo} no puede asegurar solo la Libertadores: necesita ganar "
+                       f"y que los de arriba pinchen. Su objetivo realista es la Sudamericana.")
         else:
-            titular = f"{equipo} pelea la Libertadores y depende de sí mismo."
+            titular = f"Por la Tabla General, {equipo} pelea la Libertadores y depende de sí mismo."
     L = [f"## {equipo} · Copas 2027", f"**{titular}**",
          f"Hoy está **{pos_red}º** en la tabla que reparte las copas, con **{pts_e} puntos** "
-         f"y **{gx} partidos** por jugar ({3*gx} en juego)."]
+         f"y **{gx} partidos** por jugar ({3*gx} en juego).",
+         "Este informe calcula la vía de la **Tabla General**. Las plazas obtenidas como campeón se explican "
+         "por separado y no están incluidas en esta garantía por puntos."]
 
     # ── Cada objetivo, por separado ──
-    L += _copas_bloque_objetivo(equipo, base_red, rest, pend, k_lib, "Libertadores")
-    L += _copas_bloque_objetivo(equipo, base_red, rest, pend, k_sud, "Sudamericana")
+    _nota_desempate_anual = ("Si dos o más equipos terminan igualados en puntos, la Tabla General se ordena por "
+                             "diferencia de gol, goles a favor, Fair Play y, si persiste la igualdad, sorteo.")
+    L += _copas_bloque_objetivo(
+        equipo, base_red, rest, pend, k_lib, "Libertadores",
+        cupos_reales=k_lib, nota_desempate=_nota_desempate_anual,
+    )
+    L += _copas_bloque_objetivo(
+        equipo, base_red, rest, pend, k_sud, "Sudamericana",
+        cupos_reales=6, nota_desempate=_nota_desempate_anual,
+    )
 
     # ── Rivales que le quedan: UNA sola vez ──
     if pend:
@@ -2846,8 +2915,12 @@ def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""),
 
     # ── Letra chica ──
     chica = ["### Cómo leer estos números",
+             "La Tabla General suma únicamente los puntos de las fases regulares del Apertura y del Clausura; "
+             "los playoffs no agregan puntos a esta clasificación.",
              f"La tabla que reparte copas es la **Tabla General sin los campeones**: entran **{n_t} a Libertadores** "
-             f"y los **6 siguientes a Sudamericana**."]
+             f"y los **6 siguientes a Sudamericana**.",
+             "Además de esta vía, el campeón del Clausura obtiene una plaza directa. Si un club argentino gana "
+             "la Libertadores o la Sudamericana 2026, obtiene una plaza adicional para la Libertadores 2027."]
     _camp_plaza = [(e, m) for (e, m) in P["lib"] if e not in red]
     if _camp_plaza:
         _cl = "; ".join(f"**{e}** ({m.split('(art')[0].split('—')[0].strip()})" for e, m in _camp_plaza)
@@ -3997,7 +4070,7 @@ def clasificado_eliminado(equipos, jugados, pend, n=1):
     col = CAMPEON().capitalize() if n == 1 else f"Top {n}"
     rows = []
     for e in equipos:
-        arriba = sum(1 for x in equipos if x != e and pmax[x] > pts[e])
+        arriba = sum(1 for x in equipos if x != e and pmax[x] >= pts[e])
         inalc  = sum(1 for x in equipos if x != e and pts[x] > pmax[e])
         estado = "🟢 asegurado" if arriba < n else ("🔴 sin chances" if inalc >= n else "🟡 depende")
         rows.append({"Equipo": e, "PTS": pts[e], "PTS máx": pmax[e], col: estado})
