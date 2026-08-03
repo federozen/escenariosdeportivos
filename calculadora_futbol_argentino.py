@@ -2707,7 +2707,7 @@ def lpf_plazas_copas(Z, apertura=None, camps=("", "", ""), extras=("", ""), copa
             poner(cq, "Campeón de la Copa Argentina (art. 27.3, plaza inalterable)")
             n_base -= 1
     else:
-        avisos.append("Falta el campeón de la **Copa Argentina 2026**: esa plaza es inalterable (art. 27.3) y se descuenta de los cupos por tabla.")
+        avisos.append("Falta definirse el campeón de la **Copa Argentina 2026**. Su plaza **ARGENTINA 3** permanece dentro de esa competencia y, cuando se conozca al campeón, se lo excluirá del reparto de los tres cupos de Libertadores por Tabla General.")
         n_base -= 1
     if not ca:
         avisos.append("Falta el campeón del **Apertura**."); n_base -= 1
@@ -2978,13 +2978,21 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
             if _salva:
                 prefijo = f"Como se salvan {k}, "
             elif cupos_reales is not None and cupos_reales != k:
-                prefijo = (f"Como {nombre_obj} entrega {cupos_reales} cupos y el último queda en el "
-                           f"**{k}º puesto elegible** de esta tabla, ")
+                prefijo = (f"Como {nombre_obj} entrega {cupos_reales} cupos y, con la configuración actual, "
+                           f"el último queda en el **{k}.º puesto elegible** de esta tabla, ")
             else:
                 prefijo = f"Como por esta tabla entran {k} a {nombre_obj}, "
             L.append(prefijo +
                      f"necesita que **al menos {ceden} de ellos queden detrás de {equipo}** en la clasificación final. "
                      "Es decir: ganar lo suyo y que esos rivales pierdan puntos o queden por debajo en el desempate.")
+            if cruces_con_equipo:
+                L.append(f"Estos son **topes individuales condicionados** a que {equipo} gane todos sus partidos. "
+                         f"No significa que todos puedan alcanzarlos simultáneamente: la garantía de **{meta}** "
+                         "descuenta también los cruces pendientes entre esos rivales.")
+            else:
+                L.append(f"Estos son **topes individuales** y no significa que todos puedan alcanzarlos "
+                         f"simultáneamente: la garantía de **{meta}** descuenta los cruces pendientes entre esos "
+                         "rivales.")
             if nota_desempate:
                 L.append(nota_desempate)
     else:
@@ -3087,7 +3095,7 @@ def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""),
         _lin = _linea_garantia(base_red, rest, pend, equipo, k_lib)
         if (_lin + 1 - pts_e) > 3 * gx:
             titular = (f"Por la Tabla General, {equipo} no puede asegurar solo la Libertadores: necesita ganar "
-                       f"y que los de arriba pinchen. Su objetivo realista es la Sudamericana.")
+                       f"y que los de arriba pinchen. El camino más cercano por esta vía es la Sudamericana.")
         else:
             titular = f"Por la Tabla General, {equipo} pelea la Libertadores y depende de sí mismo."
     L = [f"## {equipo} · Copas 2027", f"**{titular}**",
@@ -3158,7 +3166,15 @@ def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""),
     _camp_plaza = [(e, m) for (e, m) in P["lib"] if e not in red]
     if _camp_plaza:
         _cl = "; ".join(f"**{e}** ({m.split('(art')[0].split('—')[0].strip()})" for e, m in _camp_plaza)
-        chica.append(f"Ya tienen plaza y por eso salen de esta tabla: {_cl}. Al salir liberan lugar y corren la línea hacia abajo.")
+        if len(_camp_plaza) == 1:
+            _e, _m = _camp_plaza[0]
+            _motivo = _m.split('(art')[0].split('—')[0].strip()
+            _motivo_txt = _motivo[:1].lower() + _motivo[1:] if _motivo else "campeón"
+            chica.append(f"**{_e}** ya tiene una plaza como {_motivo_txt} y queda excluido del reparto por Tabla General. "
+                         "Por eso, el siguiente equipo elegible sube un lugar.")
+        else:
+            chica.append(f"Ya tienen plaza y quedan excluidos del reparto por Tabla General: {_cl}. "
+                         "Por eso, los siguientes equipos elegibles suben en el orden.")
     chica.append("Los puntos principales son una **garantía**: alcanzándolos entra pase lo que pase. "
                  "Con menos también puede entrar si se dan condiciones favorables. En el tramo final, el informe "
                  "muestra una escalera de puntajes y un ejemplo concreto para cada clasificación condicionada.")
