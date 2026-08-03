@@ -1682,10 +1682,15 @@ def ficha_liga_texto(e, base, rest, pend, zonas):
          f"situación actual: **{state}**.",
          f"Le quedan **{r} partidos** y **{3*r} puntos** en juego. Su techo matemático es **{d['pts'] + 3*r}**."]
     if distance is not None:
-        if distance >= 0:
-            L.append(f"Está **{distance} punto(s) por encima** del corte actual de {cutoff_pts}.")
+        if distance > 0:
+            unidad = "punto" if distance == 1 else "puntos"
+            L.append(f"Está **{distance} {unidad} por encima** del corte actual, ubicado en {cutoff_pts} puntos.")
+        elif distance == 0:
+            L.append(f"Está **igualado con el corte actual**, ubicado en {cutoff_pts} puntos.")
         else:
-            L.append(f"Está a **{abs(distance)} punto(s)** del corte actual de {cutoff_pts}.")
+            distancia = abs(distance)
+            unidad = "punto" if distancia == 1 else "puntos"
+            L.append(f"Está a **{distancia} {unidad}** del corte actual, ubicado en {cutoff_pts} puntos.")
     if pj >= 5:
         L.append(f"**Proyección lineal descriptiva:** {round(d['pts'] + ppg*r,1)} puntos si mantuviera exactamente "
                  "su promedio actual. No es la probabilidad del modelo.")
@@ -3021,10 +3026,20 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
         if meta_alcanzable is not None and meta_alcanzable != meta:
             extra_alcanzable = (f" Como {meta} no es un total alcanzable con {gx} partidos, el primer total posible "
                                 f"que supera la garantía es {meta_alcanzable}.")
-        L.append(f"**De dónde sale el {meta}:** es una **garantía conservadora**. La cuenta descuenta los cruces "
-                 "entre rivales para no sumar puntos incompatibles, pero todavía puede pedir algún punto de más. "
-                 f"Alcanzar o superar **{meta}** asegura la clasificación.{extra_alcanzable} El mínimo exacto puede "
-                 "ser menor y se calcula en el Radar cuando quedan seis fechas o menos.")
+        if meta > techo:
+            diferencia_techo = meta - techo
+            unidad = "punto" if diferencia_techo == 1 else "puntos"
+            L.append(f"**De dónde sale el {meta}:** es una **garantía conservadora**. La cuenta descuenta los cruces "
+                     "entre rivales para no sumar puntos incompatibles, pero todavía puede pedir algún punto de más. "
+                     f"La línea matemática de garantía está en **{meta}**, {diferencia_techo} {unidad} por encima "
+                     f"del techo de {equipo} (**{techo}**). Por eso ya no puede alcanzarla y necesita resultados "
+                     "favorables de sus competidores. El mínimo exacto puede ser menor y se calcula en el Radar "
+                     "cuando quedan seis fechas o menos.")
+        else:
+            L.append(f"**De dónde sale el {meta}:** es una **garantía conservadora**. La cuenta descuenta los cruces "
+                     "entre rivales para no sumar puntos incompatibles, pero todavía puede pedir algún punto de más. "
+                     f"Alcanzar o superar **{meta}** asegura la clasificación.{extra_alcanzable} El mínimo exacto puede "
+                     "ser menor y se calcula en el Radar cuando quedan seis fechas o menos.")
     if _ladder and _ladder.get("available") and _ladder.get("rows"):
         _rows = _ladder["rows"]
         _conditioned = [row for row in _rows if not row.guaranteed]
@@ -3057,10 +3072,15 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
                 L.append(f"**El atajo:** ganándoles a {', '.join(h2h)} la meta baja de {meta} a **{meta2}**, "
                          f"porque suma él y ellos se quedan sin sumar.")
             else:
+                if nombre_obj == "Octavos":
+                    contexto_atajo = "los puestos de clasificación de su zona"
+                elif _salva:
+                    contexto_atajo = "evitar el descenso por la Tabla Anual"
+                else:
+                    contexto_atajo = "las plazas distribuidas mediante esta tabla"
                 L.append(f"**El atajo:** {len(h2h)} de sus partidos son contra equipos que también compiten por "
-                         "las plazas distribuidas mediante esta tabla. Ganar no otorga puntos extra, pero produce un "
-                         "doble efecto competitivo: suma tres y evita que el rival los consiga. Por eso esos cruces "
-                         "pueden bajar la exigencia.")
+                         f"{contexto_atajo}. Ganar no otorga puntos extra, pero produce un doble efecto competitivo: "
+                         "suma tres y evita que el rival los consiga. Por eso esos cruces pueden bajar la exigencia.")
     return L
 
 def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""), extras=("", ""), pend=None):
