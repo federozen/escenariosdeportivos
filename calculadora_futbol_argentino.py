@@ -23,7 +23,7 @@ from lpf_scenarios import exact_result_scenarios, point_ladder, scenario_rank_bo
 # abajo para que la app funcione igual. Mantener ambas versiones sincronizadas.
 try:
     from lpf_exact import next_round_rank_bounds, safe_guarantee_line, safe_average_guarantee_points
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     _LPF_EXACT_ESPEJO = r'''
 """Núcleo exacto y auditable para las cuentas sensibles de la LPF.
 
