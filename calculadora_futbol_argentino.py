@@ -22,7 +22,7 @@ from lpf_scenarios import exact_result_scenarios, point_ladder, scenario_rank_bo
 # (por ejemplo, si se subió sólo este .py al repo), se usa la copia espejo de
 # abajo para que la app funcione igual. Mantener ambas versiones sincronizadas.
 try:
-    from lpf_exact import next_round_rank_bounds, safe_guarantee_line
+    from lpf_exact import next_round_rank_bounds, safe_guarantee_line, safe_average_guarantee_points
 except ModuleNotFoundError:
     _LPF_EXACT_ESPEJO = r'''
 """Núcleo exacto y auditable para las cuentas sensibles de la LPF.
@@ -86,18 +86,31 @@ def safe_guarantee_line(
         # Los candidatos más ajustados primero suelen descartar antes; en los casos
         # fáciles la función sale con el primer subconjunto factible.
         candidates.sort(key=lambda name: (ceilings[name], -pts[name]))
-        edge_set = {frozenset((a, b)) for a, b in relevant_edges}
         for chosen in combinations(candidates, k):
             deficits = [max(0, target_points - pts[name]) for name in chosen]
             if any(deficit > 3 * games_left[name] for name, deficit in zip(chosen, deficits)):
                 continue
-            internal = sum(
-                1 for a, b in combinations(chosen, 2) if frozenset((a, b)) in edge_set
-            )
-            # Cada cruce interno fue contado dos veces en sum(g); se resta una
-            # capacidad de tres puntos para dejar el máximo real del partido.
-            capacity = 3 * sum(games_left[name] for name in chosen) - 3 * internal
-            if sum(deficits) <= capacity:
+            chosen_set = set(chosen)
+            internal_edges = [
+                (a, b) for a, b in relevant_edges if a in chosen_set and b in chosen_set
+            ]
+            degree = {name: 0 for name in chosen}
+            for a, b in internal_edges:
+                degree[a] += 1
+                degree[b] += 1
+            # Primero se asigna a cada club el máximo de sus partidos externos.
+            # Lo que todavía necesita debe salir de los cruces internos, que
+            # reparten como máximo tres puntos por partido entre ambos equipos.
+            residual = []
+            valid = True
+            for name, deficit in zip(chosen, deficits):
+                external_games = max(0, games_left[name] - degree[name])
+                need_internal = max(0, deficit - 3 * external_games)
+                if need_internal > 3 * degree[name]:
+                    valid = False
+                    break
+                residual.append(need_internal)
+            if valid and sum(residual) <= 3 * len(internal_edges):
                 return True
         return False
 
@@ -112,6 +125,105 @@ def safe_guarantee_line(
         else:
             high = middle - 1
     return answer
+
+
+def safe_average_guarantee_points(
+    totals: Mapping[str, int],
+    played: Mapping[str, int],
+    remaining: Mapping[str, int],
+    matches: Iterable[tuple[str, str]],
+    team: str,
+    relegation_slots: int,
+) -> int | None:
+    """Puntos adicionales alcanzables que garantizan escapar de los promedios.
+
+    La comparación se hace por cocientes finales y sin usar ``float``. Un empate
+    de promedio se considera desfavorable: para estar garantizado el equipo debe
+    dejar estrictamente por debajo a, como mínimo, ``relegation_slots`` rivales.
+
+    La relajación prueba todos los subconjuntos de rivales que podrían terminar
+    igual o por encima del promedio objetivo. Descuenta los cruces internos,
+    porque dos clubes que se enfrentan no pueden sumar tres puntos cada uno.
+    Como no fija qué partidos producen los puntos del equipo analizado, conserva
+    como disponibles los puntos de sus rivales directos; por eso puede pedir algún
+    punto de más, pero nunca declarar una salvación que aún dependa de resultados.
+    """
+    if team not in totals:
+        return None
+    names = [name for name in totals if name != team]
+    k = max(0, int(relegation_slots))
+    n = len(names) + 1
+    if k <= 0:
+        return 0
+    if k >= n:
+        return None
+
+    total_points = {name: int(totals.get(name, 0)) for name in totals}
+    games_played = {name: max(0, int(played.get(name, 0))) for name in totals}
+    games_left = {name: max(0, int(remaining.get(name, 0))) for name in totals}
+    final_games = {name: games_played[name] + games_left[name] for name in totals}
+    if final_games.get(team, 0) <= 0:
+        return None
+
+    # Si al menos n-k rivales pueden terminar igual o por encima, el equipo
+    # todavía podría quedar entre los k peores (los empates se toman adversos).
+    rivals_needed = n - k
+    relevant_edges = [
+        (a, b)
+        for a, b in matches
+        if a in totals and b in totals and a != team and b != team
+    ]
+
+    def minimum_add_to_reach(name: str, target_num: int, target_den: int) -> int:
+        den = final_games.get(name, 0)
+        if den <= 0:
+            return 10**9
+        numerator = target_num * den - total_points[name] * target_den
+        return max(0, -(-numerator // target_den))
+
+    def rivals_can_keep_team_in_bottom(target_add: int) -> bool:
+        target_num = total_points[team] + int(target_add)
+        target_den = final_games[team]
+        deficits = {
+            name: minimum_add_to_reach(name, target_num, target_den)
+            for name in names
+        }
+        candidates = [
+            name for name in names
+            if deficits[name] <= 3 * games_left[name]
+        ]
+        if len(candidates) < rivals_needed:
+            return False
+        candidates.sort(key=lambda name: (3 * games_left[name] - deficits[name], total_points[name]))
+
+        for chosen in combinations(candidates, rivals_needed):
+            chosen_set = set(chosen)
+            internal_edges = [
+                (a, b) for a, b in relevant_edges if a in chosen_set and b in chosen_set
+            ]
+            degree = {name: 0 for name in chosen}
+            for a, b in internal_edges:
+                degree[a] += 1
+                degree[b] += 1
+            residual = []
+            valid = True
+            for name in chosen:
+                external_games = max(0, games_left[name] - degree[name])
+                need_internal = max(0, deficits[name] - 3 * external_games)
+                if need_internal > 3 * degree[name]:
+                    valid = False
+                    break
+                residual.append(need_internal)
+            if valid and sum(residual) <= 3 * len(internal_edges):
+                return True
+        return False
+
+    r = games_left[team]
+    reachable = sorted({3 * wins + draws for wins in range(r + 1) for draws in range(r - wins + 1)})
+    for added in reachable:
+        if not rivals_can_keep_team_in_bottom(added):
+            return added
+    return None
 
 
 def next_round_rank_bounds(
@@ -2260,42 +2372,135 @@ def promedios_df(base, rest, prev):
     df.insert(0, "Pos", range(1, len(df) + 1))
     return df
 
-def promedio_que_necesita_texto(e, base, rest, prev, k=1):
+def promedio_que_necesita_texto(e, base, rest, prev, k=1, pend=None):
+    """Explica el descenso por promedios con una garantía colectiva conservadora.
+
+    Los pisos y techos individuales son exactos. La cifra para salvarse sin depender
+    descuenta los cruces entre rivales mediante ``safe_average_guarantee_points`` y
+    considera adverso un empate de promedio. Los partidos del equipo analizado se
+    condicionan sólo cuando el escenario explícito es "gana todos".
+    """
     if e not in base:
         return f"No encuentro a {e} en la tabla cargada."
+    pend = list(pend or [])
     P = _prom_rangos(base, rest, prev)
-    n = len(P); d = P[e]
-    df = promedios_df(base, rest, prev); pos = int(df[df["Equipo"] == e]["Pos"].iloc[0])
-    abajo_seguro = sorted([x for x in P if x != e and P[x]["techo"] < d["piso"]], key=lambda x: P[x]["techo"])
-    arriba_seguro = sorted([x for x in P if x != e and P[x]["piso"] > d["techo"]], key=lambda x: -P[x]["piso"])
-    L = [f"**¿{e} y el descenso por promedios?** (descienden los {k} peores)",
-         f"Está {pos}º de {n} con promedio **{d['hoy']:.3f}** ({d['tp']} pts en {d['tj']} PJ, contando temporadas previas). "
-         f"Perdiendo todo baja a {d['piso']:.3f}; ganando todo sube a {d['techo']:.3f}."]
+    n = len(P)
+    d = P[e]
+    df = promedios_df(base, rest, prev)
+    pos = int(df[df["Equipo"] == e]["Pos"].iloc[0])
+    abajo_seguro = sorted(
+        [x for x in P if x != e and P[x]["techo"] < d["piso"]],
+        key=lambda x: P[x]["techo"],
+    )
+    arriba_seguro = sorted(
+        [x for x in P if x != e and P[x]["piso"] > d["techo"]],
+        key=lambda x: -P[x]["piso"],
+    )
+    L = [
+        f"**¿{e} y el descenso por promedios?** (descienden los {k} peores)",
+        f"Está {pos}º de {n} con promedio **{d['hoy']:.3f}** "
+        f"({d['tp']} pts en {d['tj']} PJ, contando temporadas previas). "
+        f"Perdiendo todo baja a **{d['piso']:.3f}**; ganando todo sube a **{d['techo']:.3f}**.",
+    ]
+
     if len(abajo_seguro) >= k:
         muestra = ", ".join(abajo_seguro[:4])
-        L.append(f"✅ **Ya está a salvo del promedio**: aunque pierda todo lo que le queda, {muestra} "
-                 f"no lo pueden superar ni ganando todo (sus techos quedan por debajo de tu piso).")
+        L.append(
+            f"✅ **Ya está a salvo del promedio:** aunque pierda todo lo que le queda, {muestra} "
+            "no pueden alcanzarlo ni ganando todo; sus techos quedan por debajo de su piso."
+        )
     elif len(arriba_seguro) >= n - k:
-        L.append(f"❌ **Condenado por promedio**: aun ganando todo llega a {d['techo']:.3f} y ya hay "
-                 f"{len(arriba_seguro)} equipos que ni perdiendo todo bajan de ese número.")
+        L.append(
+            f"❌ **Condenado por promedio:** aun ganando todo llega a {d['techo']:.3f} y ya hay "
+            f"{len(arriba_seguro)} equipos cuyos pisos quedan por encima de ese número."
+        )
     else:
-        pelea = sorted([x for x in P if x != e and not (P[x]["techo"] < d["piso"]) and not (P[x]["piso"] > d["techo"])],
-                       key=lambda x: P[x]["hoy"])
-        techos = sorted((P[x]["techo"] for x in P if x != e))
-        objetivo = techos[k - 1] if len(techos) >= k else 0.0
-        den = d["tj"] + d["r"]
-        need = objetivo * den - d["tp"]
-        import math
-        pts_need = max(0, math.ceil(need + 1e-9))
+        pelea = sorted(
+            [
+                x for x in P if x != e
+                and not (P[x]["techo"] < d["piso"])
+                and not (P[x]["piso"] > d["techo"])
+            ],
+            key=lambda x: P[x]["hoy"],
+        )
         if pelea:
             L.append("⚔️ **Pelea mano a mano con:** " + ", ".join(pelea[:6]) + ".")
-        if d["r"] and pts_need <= 3 * d["r"]:
-            L.append(f"Para salvarse **sin depender de nadie** necesita sumar **{pts_need} pts** de los {3*d['r']} en juego "
-                     f"(así su promedio supera el techo del {k}º peor).")
+
+        totals = {x: P[x]["tp"] for x in P}
+        played = {x: P[x]["tj"] for x in P}
+        pts_need = safe_average_guarantee_points(
+            totals,
+            played,
+            rest,
+            pend,
+            e,
+            k,
+        )
+        max_points = 3 * d["r"]
+        if pts_need is not None and pts_need <= max_points:
+            final_den = d["tj"] + d["r"]
+            final_avg = (d["tp"] + pts_need) / final_den if final_den else 0.0
+            if pts_need == 0:
+                L.append(
+                    "✅ **Garantía colectiva:** aun sin sumar más puntos, los cruces pendientes impiden que "
+                    f"todos los rivales necesarios lo alcancen. Su piso final es {final_avg:.3f}."
+                )
+            else:
+                L.append(
+                    f"Para salvarse **sin depender de nadie**, la garantía conservadora exige sumar "
+                    f"**{_texto_cantidad(pts_need, 'punto')}** de los {max_points} en juego y terminar con "
+                    f"un promedio de al menos **{final_avg:.3f}**."
+                )
+            L.append(
+                "La cuenta evalúa los cocientes finales con sus denominadores reales y descuenta los "
+                "enfrentamientos entre rivales: cuando dos competidores se cruzan, no pueden ganar ambos. "
+                "Un empate de promedio se considera desfavorable para no declarar una salvación prematura."
+            )
         else:
-            L.append("Ni ganando todo se asegura solo: necesita sumar **y** que los de abajo pinchen.")
-    L.append("_Exacto por rangos de promedio (piso y techo). Los recién ascendidos computan solo la temporada actual: así es la regla. "
-             "Cargá las temporadas previas en el panel «📉 Promedios»._")
+            L.append(
+                "Ni ganando todo obtiene una garantía matemática por sí solo: necesita sumar y que otros "
+                "rivales pierdan puntos o queden por debajo en la definición correspondiente."
+            )
+
+        # En el escenario explícito de ganar todos, cada rival directo pierde ese
+        # encuentro y no puede conservar su techo individual general.
+        cruces_con_equipo = {}
+        for local, visitante in pend:
+            if e not in (local, visitante):
+                continue
+            rival = visitante if local == e else local
+            if rival in P and rival != e:
+                cruces_con_equipo[rival] = cruces_con_equipo.get(rival, 0) + 1
+        if cruces_con_equipo:
+            condicionados = []
+            for rival, cruces in cruces_con_equipo.items():
+                rd = P[rival]
+                den = rd["tj"] + rd["r"]
+                general = rd["techo"]
+                condicionado = (
+                    (rd["tp"] + 3 * max(0, rd["r"] - cruces)) / den
+                    if den else 0.0
+                )
+                condicionados.append((rival, condicionado, general))
+            condicionados.sort(key=lambda item: (-item[1], item[0]))
+            muestra = " · ".join(
+                f"{rival}: {cond:.3f} condicionado (techo general {general:.3f})"
+                for rival, cond, general in condicionados[:6]
+            )
+            if len(condicionados) > 6:
+                muestra += f" · y {len(condicionados) - 6} más"
+            L.append(
+                f"**Si {e} gana todos:** sus rivales directos pierden necesariamente ese partido, por lo que "
+                f"sus techos bajan. {muestra}."
+            )
+
+    L.append(
+        "_Los pisos y techos individuales son exactos. La garantía colectiva es conservadora: descuenta "
+        "los puntos incompatibles de los cruces entre rivales y, cuando se supone que el equipo gana todo, "
+        "también las derrotas obligatorias de sus rivales directos. Puede pedir algún punto de más, pero no "
+        "declarar una salvación falsa. Los recién ascendidos computan sólo la temporada actual. Cargá las "
+        "temporadas previas en el panel «📉 Promedios»._"
+    )
     return "\n\n".join(L)
 
 # ═══════════════════════════════════════════════════════════════════════════════════
@@ -2426,7 +2631,7 @@ def lpf_descenso_texto(Z, rest, apertura=None, prev=None, n_anual=1, n_prom=1, e
         L.append("## Vía 1 · Tabla General (anual)")
         L += _copas_bloque_objetivo(equipo, anual, rest, pend, k_salvarse, "Permanencia por la anual", modo="salvarse")
         L.append("## Vía 2 · Promedios")
-        L.append(promedio_que_necesita_texto(equipo, anual, rest, prev or {}, n_prom))
+        L.append(promedio_que_necesita_texto(equipo, anual, rest, prev or {}, n_prom, pend))
         if pend:
             mis = [(b if a == equipo else a) for (a, b) in pend if equipo in (a, b)]
             if mis:
@@ -2722,8 +2927,25 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
     meta_alcanzable = mio + suma_alcanzable if suma_alcanzable is not None else None
     L = []
     pmax = {x: pts[x] + 3 * rest.get(x, 0) for x in base_red}
+
+    # Si el relato supone que el equipo gana todos sus partidos, los rivales que
+    # todavía deben enfrentarlo no pueden conservar simultáneamente el tope general:
+    # en ese cruce suman 0. Estos topes condicionados se usan sólo para explicar la
+    # condición; la garantía matemática sigue calculándose con el motor conservador.
+    cruces_con_equipo = {}
+    for a, b in (pend or []):
+        if equipo not in (a, b):
+            continue
+        rival = b if a == equipo else a
+        if rival in base_red and rival != equipo:
+            cruces_con_equipo[rival] = cruces_con_equipo.get(rival, 0) + 1
+    pmax_si_gana_todo = {
+        x: pts[x] + 3 * max(0, rest.get(x, 0) - cruces_con_equipo.get(x, 0))
+        for x in base_red
+    }
     amenazas_techo = sorted(
-        [(x, pmax[x]) for x in base_red if x != equipo and pmax[x] >= techo],
+        [(x, pmax_si_gana_todo[x]) for x in base_red
+         if x != equipo and pmax_si_gana_todo[x] >= techo],
         key=lambda kv: (-kv[1], -pts[kv[0]], kv[0]),
     )
     if faltan > 3 * gx:
@@ -2738,12 +2960,20 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
         if amenazas_techo:
             limite = 12
             muestra = amenazas_techo[:limite]
+            etiqueta_tope = "tope condicionado" if cruces_con_equipo else "tope general"
             lst = " · ".join(
-                f"{x} ({pts[x]} pts, {rest.get(x, 0)} por jugar, tope {m})" for x, m in muestra
+                f"{x} ({pts[x]} pts, {rest.get(x, 0)} por jugar, {etiqueta_tope} {m})"
+                for x, m in muestra
             )
             if len(amenazas_techo) > limite:
                 lst += f" · y {len(amenazas_techo) - limite} más"
-            L.append(f"**La condición:** aun ganando todo terminaría con {techo}. Hay "
+            if cruces_con_equipo:
+                detalle_topes = (f"Considerando esas victorias —y descontando a cada rival el partido que "
+                                  f"perdería ante {equipo}—")
+            else:
+                detalle_topes = ("Como no hay cruces del equipo identificados en el fixture pendiente, este "
+                                  "listado usa topes generales y puede sobreestimar la amenaza")
+            L.append(f"**La condición:** aun ganando todo terminaría con {techo}. {detalle_topes}, hay "
                      f"**{len(amenazas_techo)} equipos** que todavía pueden alcanzar o superar ese número: {lst}.")
             if _salva:
                 prefijo = f"Como se salvan {k}, "
@@ -2819,9 +3049,10 @@ def _copas_bloque_objetivo(equipo, base_red, rest, pend, k, nombre_obj, modo="en
                 L.append(f"**El atajo:** ganándoles a {', '.join(h2h)} la meta baja de {meta} a **{meta2}**, "
                          f"porque suma él y ellos se quedan sin sumar.")
             else:
-                L.append(f"**El atajo:** {len(h2h)} de sus partidos son contra rivales que pelean este mismo lugar. "
-                         "Ganar no otorga puntos extra, pero produce un doble efecto competitivo: suma tres y evita "
-                         "que el rival los consiga. Por eso esos cruces pueden bajar la exigencia.")
+                L.append(f"**El atajo:** {len(h2h)} de sus partidos son contra equipos que también compiten por "
+                         "las plazas distribuidas mediante esta tabla. Ganar no otorga puntos extra, pero produce un "
+                         "doble efecto competitivo: suma tres y evita que el rival los consiga. Por eso esos cruces "
+                         "pueden bajar la exigencia.")
     return L
 
 def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""), extras=("", ""), pend=None):
@@ -2909,16 +3140,19 @@ def lpf_copas_necesita_texto(equipo, Z, rest, apertura=None, camps=("", "", ""),
     if len(red) > n_t + 6:
         _sud_espera = red[n_t + 6]
         L.append(f"Para la Sudamericana, el primero que espera hoy es **{_sud_espera}**. Puede entrar si un equipo "
-                 "ubicado por encima obtiene una plaza de Libertadores como campeón y deja de ocupar un cupo de Sudamericana.")
-    L.append("**Excepción Copa Argentina:** si su campeón también ganó Apertura o Clausura, la plaza ARGENTINA 3 "
-             "se hereda dentro de la Copa Argentina; no pasa automáticamente al siguiente de la Anual.")
+                 "ubicado por encima obtiene una plaza directa de Libertadores y el reordenamiento corre un lugar "
+                 "hacia abajo la línea de clasificación.")
+    L.append("**Excepción Copa Argentina:** si su campeón ya obtuvo una plaza como campeón del Apertura, Clausura, "
+             "Libertadores 2026 o Sudamericana 2026, la plaza ARGENTINA 3 pasa al siguiente equipo de Primera mejor "
+             "ubicado dentro de la Copa Argentina; no pasa automáticamente al siguiente de la Tabla General.")
 
     # ── Letra chica ──
     chica = ["### Cómo leer estos números",
              "La Tabla General suma únicamente los puntos de las fases regulares del Apertura y del Clausura; "
              "los playoffs no agregan puntos a esta clasificación.",
-             f"La tabla que reparte copas es la **Tabla General sin los campeones**: entran **{n_t} a Libertadores** "
-             f"y los **6 siguientes a Sudamericana**.",
+             "Para repartir las plazas se utiliza la **Tabla General**, excluyendo a los equipos que ya hayan "
+             f"obtenido una plaza de Libertadores. Los **{n_t} primeros elegibles** clasifican a la Libertadores "
+             "y los **6 siguientes**, a la Sudamericana.",
              "Además de esta vía, el campeón del Clausura obtiene una plaza directa. Si un club argentino gana "
              "la Libertadores o la Sudamericana 2026, obtiene una plaza adicional para la Libertadores 2027."]
     _camp_plaza = [(e, m) for (e, m) in P["lib"] if e not in red]
@@ -6938,7 +7172,7 @@ def _router_liga_tabla(acc, E):
         prevP = st.session_state.get("PROMEDIOS") or {}
         kk = int(st.session_state.get("PROM_K", 1))
         if equipo:
-            return [("md", promedio_que_necesita_texto(equipo, base, rest, prevP, kk)),
+            return [("md", promedio_que_necesita_texto(equipo, base, rest, prevP, kk, E["pendientes"])),
                     ("df", promedios_df(base, rest, prevP), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)")]
         return [("df", promedios_df(base, rest, prevP), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)"),
                 ("md", "_«Solo actual» = sin temporadas previas cargadas (recién ascendidos: es la regla). "
@@ -7081,7 +7315,7 @@ def ejecutar_accion(acc):
         prev = st.session_state.get("PROMEDIOS") or {}
         kk = int(st.session_state.get("PROM_K", 1))
         if equipo:
-            return [("md", promedio_que_necesita_texto(equipo, basex, restx, prev, kk)),
+            return [("md", promedio_que_necesita_texto(equipo, basex, restx, prev, kk, pen)),
                     ("df", promedios_df(basex, restx, prev), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)")]
         return [("df", promedios_df(basex, restx, prev), "Tabla de promedios (piso = perdiendo todo · techo = ganando todo)"),
                 ("md", "_«Solo actual» = sin temporadas previas cargadas (recién ascendidos: es la regla). "
