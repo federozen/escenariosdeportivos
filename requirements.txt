@@ -7,3 +7,6 @@ scipy>=1.11
 # Para narrativa gráfica del rediseño (descomentá/usá si los necesitás):
 # plotly>=5.22
 # st.graphviz_chart y st.altair_chart NO requieren paquetes extra (vienen con Streamlit)
+lxml>=5.0
+beautifulsoup4>=4.12
+html5lib>=1.1
