@@ -1,7 +1,7 @@
 """
 ⚽ Calculadora de escenarios — LPF 2026
 Convertido de Jupyter Notebook (v2) a Streamlit
-Actualización 3.6.5: corrige nombres duplicados de FutbolArgentino.com y hace compatible el respaldo JSON.
+Actualización 3.6.4: narrativas finales revisadas para playoffs, copas, zonas y previa de fecha.
 """
 
 import streamlit as st
@@ -2163,65 +2163,12 @@ _FUTBOLARGENTINO_ALIASES = {
 
 
 def _source_team_name(raw_team, source_name=""):
-    """Normaliza el nombre leído desde una tabla externa.
-
-    FutbolArgentino.com puede incluir en la misma celda el nombre largo y el
-    abreviado (por ejemplo, ``ArgentinosArgentinos J.``). En vez de conservar
-    esa concatenación, se busca el club conocido con la coincidencia más
-    específica. Los nombres internos siguen siendo los canónicos completos.
-    """
     clean = re.sub(r"^\s*\d+[.)-]?\s*", "", str(raw_team or ""))
     clean = re.sub(r"\s+", " ", clean).strip()
-    if not clean:
-        return ""
-
     if source_name == "FutbolArgentino.com":
-        normalized = _norm_table_label(clean)
-        alias = _FUTBOLARGENTINO_ALIASES.get(normalized)
+        alias = _FUTBOLARGENTINO_ALIASES.get(_norm_table_label(clean))
         if alias:
-            return canon_club(alias)
-
-        # Primero se prueba el nombre tal como llegó. Esto resuelve las celdas
-        # que contienen un único nombre sin abreviaturas duplicadas.
-        direct = canon_club(clean)
-        if direct in LPF_CLUBES:
-            return direct
-
-        # El HTML del proveedor puede concatenar texto visible, texto móvil y
-        # atributos de accesibilidad. Se eliminan separadores y se puntúa cada
-        # club por la variante más larga contenida en la celda. Así, por
-        # ejemplo, "Central Córdoba SECentral Córdoba" no se confunde con
-        # Rosario Central y "Gimnasia MendozaGimnasia (M)" no se confunde con
-        # Gimnasia de La Plata.
-        compact = re.sub(r"[^a-z0-9]+", "", normalized)
-        scores = {}
-        source_aliases = {
-            "Atlético Tucumán": ["a tucuman"],
-            "Argentinos Juniors": ["argentinos j"],
-            "Central Córdoba": ["central cordoba se", "c cordoba"],
-            "Estudiantes de Río Cuarto": ["estudiantes rio cuarto", "estudiantes rc"],
-            "Gimnasia de Mendoza": ["gimnasia mendoza", "gimnasia m"],
-            "Independiente Rivadavia": ["ind rivadavia"],
-            "Talleres": ["talleres de cordoba"],
-            "Unión": ["union de santa fe"],
-        }
-        for canonical, aliases in LPF_CLUBES.items():
-            variants = [canonical, *aliases, *source_aliases.get(canonical, [])]
-            best = 0
-            for variant in variants:
-                token = re.sub(r"[^a-z0-9]+", "", _norm_table_label(variant))
-                if len(token) >= 4 and token in compact:
-                    best = max(best, len(token))
-            if best:
-                scores[canonical] = best
-
-        if scores:
-            ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-            best_team, best_score = ordered[0]
-            second_score = ordered[1][1] if len(ordered) > 1 else -1
-            if best_score > second_score:
-                return best_team
-
+            return alias
     return canon_club(clean)
 
 
@@ -2540,35 +2487,11 @@ def _load_lpf_snapshot(max_age_hours=LPF_SNAPSHOT_MAX_AGE_HOURS):
                     f"respaldo de {location} demasiado viejo ({_fmt_num_es(age_hours / 24, 1)} días)"
                 )
                 continue
-            raw_zones = payload.get("zones") or payload.get("zonas") or {}
-            if not raw_zones:
-                # Compatibilidad con respaldos que guardaron A/B directamente
-                # en la raíz del JSON.
-                raw_zones = {
-                    key: payload.get(key)
-                    for key in ("A", "B", "Zona A", "Zona B", "zone_a", "zone_b")
-                    if isinstance(payload.get(key), dict)
-                }
-
-            zones = {}
-            for raw_label, base in raw_zones.items():
-                label_norm = _norm_table_label(raw_label).replace("_", " ")
-                if label_norm in {"a", "zona a", "zone a"}:
-                    label = "A"
-                elif label_norm in {"b", "zona b", "zone b"}:
-                    label = "B"
-                else:
-                    continue
-                zones[label] = canon_base(base)
-
-            annual_raw = (
-                payload.get("annual")
-                or payload.get("anual")
-                or payload.get("tabla_anual")
-                or payload.get("tabla general")
-                or {}
-            )
-            annual = canon_base(annual_raw)
+            zones = {
+                label: canon_base(base)
+                for label, base in (payload.get("zones") or {}).items()
+            }
+            annual = canon_base(payload.get("annual") or {})
             _validate_lpf_tables(zones, annual)
             source = str(payload.get("source") or "fuente desconocida")
             return zones, annual, source, age_hours, None
@@ -10225,8 +10148,20 @@ def render_visualizations_workspace(E):
         if frame is not None and not frame.empty:
             ui_dataframe(frame, use_container_width=True, hide_index=True)
             impact = frame[["Partido", "Diferencia"]].copy()
-            impact["Impacto (pp)"] = impact["Diferencia"].str.replace(" pp", "", regex=False).astype(float)
-            st.bar_chart(impact.set_index("Partido")[["Impacto (pp)"]])
+            # La interfaz muestra decimales con coma (por ejemplo, "0,35 pp").
+            # Convertimos de forma segura al formato numerico que espera pandas.
+            impact["Impacto (pp)"] = pd.to_numeric(
+                impact["Diferencia"]
+                .astype("string")
+                .str.replace(" pp", "", regex=False)
+                .str.replace(",", ".", regex=False),
+                errors="coerce",
+            )
+            impact = impact.dropna(subset=["Impacto (pp)"])
+            if not impact.empty:
+                st.bar_chart(impact.set_index("Partido")[["Impacto (pp)"]])
+            else:
+                ui_caption("No hay valores numericos de impacto disponibles para graficar.")
 
     with tab_radar:
         render_definition_radar(E)
